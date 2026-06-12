@@ -1,0 +1,1105 @@
+---
+title: "DAT 490 Capstone: Data Cleaning and Spatial Join"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+---
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(tigris_use_cache = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(skimr)
+library(here)
+library(tidycensus)
+library(sf)
+library(tigris)
+library(kableExtra)
+library(mice)
+```
+
+# LAPD Data
+
+## Load Raw Data
+
+```{r lapd-load, echo = FALSE, warning = FALSE}
+lapd_raw <- read_csv(here("Crime_Data_from_2020_to_2024.csv"),
+                     show_col_types = FALSE) |>
+  clean_names()
+
+head(lapd_raw)
+```
+ 
+## Select Columns
+
+```{r lapd-select-cols}
+lapd <- lapd_raw |>
+  select(
+    rpt_no       = dr_no,        ##report number
+    date_occ,
+    time_occ,
+    crime_cd     = crm_cd,       ##crime code
+    case_status  = status_desc,  ##case status
+    lat,
+    lon
+  )
+
+head(lapd)
+```
+
+## Clean Time Data
+
+```{r lapd-dates}
+lapd <- lapd |>
+  mutate(
+    date_occ = as.Date(mdy_hms(date_occ)),
+    year_occ = year(date_occ)
+  )
+```
+
+## Clean Coordinates & Flag Invalid Locations
+
+```{r lapd-coordinates}
+lapd <- lapd |>
+  mutate(
+    lat_clean = if_else(
+      lat == 0 | lon == 0 |
+        (round(lat, 4) == 34.0195 & round(lon, 4) == -118.4108),
+      NA_real_, lat
+    ),
+    lon_clean = if_else(
+      lat == 0 | lon == 0 |
+        (round(lat, 4) == 34.0195 & round(lon, 4) == -118.4108),
+      NA_real_, lon
+    ),
+    has_coords = !is.na(lat_clean) & !is.na(lon_clean)
+  )
+
+cat("Records with valid coordinates:", sum(lapd$has_coords), "\n", 
+    "Records with missing coordinates removed:  ", sum(!lapd$has_coords), "\n", 
+    sep = "")
+
+lapd <- lapd |> filter(has_coords)
+
+```
+
+## Remove Duplicates
+
+```{r lapd-dup}
+n_before <- nrow(lapd)
+
+lapd <- lapd |>
+  distinct(rpt_no, .keep_all = TRUE)
+
+cat("Duplicate rows removed:", n_before - nrow(lapd), "\n",
+    "Final row count:       ", nrow(lapd), "\n",
+    sep = "")
+```
+
+## Missing Values Check
+
+```{r lapd-missing-values}
+n_missing <- sum(is.na(lapd))
+cat("Total missing values in cleaned LAPD data: ", n_missing, "\n")
+```
+
+\newpage
+
+## Derive Variables
+
+```{r lapd-derive}
+lapd <- lapd |>
+  mutate(
+    ##crime type categories based on ucr/compstat codes
+    crime_category = case_when(
+      crime_cd %in% c(110, 113)                            ~ "Homicide",
+      crime_cd %in% c(210, 220)                            ~ "Robbery",
+      crime_cd %in% c(230, 231, 235, 236, 250, 251,
+                      761, 926)                            ~ "Assault",
+      crime_cd %in% c(624, 625, 626, 627, 628, 629)        ~ "Simple Assault",
+      crime_cd %in% c(121, 122, 815, 820, 821,
+                      822, 860)                            ~ "Sexual Assault",
+      crime_cd %in% c(760, 762, 810, 812, 813,
+                      814, 850)                            ~ "Sex Offenses",
+      crime_cd %in% c(310, 320)                            ~ "Burglary",
+      crime_cd %in% c(330, 331, 341, 345, 354, 410, 420,
+                      421, 440, 441, 444, 445, 450, 451,
+                      452, 453, 470, 471, 473, 474, 475,
+                      480, 485, 487, 950)                  ~ "Theft",
+      crime_cd %in% c(510, 520, 433)                       ~ "Vehicle Theft",
+      crime_cd %in% c(343, 350, 351, 352, 353,
+                      442, 443)                            ~ "Shoplifting",
+      crime_cd %in% c(740, 745)                            ~ "Vandalism",
+      crime_cd %in% c(865, 940)                            ~ "Drug/Narcotic",
+      crime_cd %in% c(753, 756)                            ~ "Weapons",
+      crime_cd %in% c(648)                                 ~ "Arson",
+      TRUE                                                 ~ "Other"
+    ),
+    ##violent crime flag
+    is_violent = crime_category %in% c(
+      "Homicide", "Robbery", "Assault", "Sexual Assault",
+      "Sex Offenses", "Weapons", "Arson"
+    ),
+
+    ##property crime flag
+    is_property = crime_category %in% c(
+      "Burglary", "Theft", "Vehicle Theft", "Shoplifting", "Vandalism"
+    ),
+
+    ##binary outcome for rq1: violent (1) vs property (0)
+    ##incidents classified as neither are excluded from rq1 modeling
+    crime_type = case_when(
+      is_violent  ~ "Violent",
+      is_property ~ "Property",
+      TRUE        ~ "Other"
+    )
+  )
+```
+
+## Export Clean LAPD Data
+```{r lapd-export}
+if (!dir.exists("output")) dir.create("output")
+
+if (!file.exists("output/lapd_clean.rds")) {
+  saveRDS(lapd, "output/lapd_clean.rds")
+  write_csv(lapd, "output/lapd_clean.csv")
+  cat("Files saved to /output:\n",
+      "                         lapd_clean.rds\n",
+      "                         lapd_clean.csv\n",
+      sep = "")
+} else {
+  cat("Output files already exist.\n")
+}
+```
+
+\newpage 
+
+# ACS Census Data
+
+## Load Raw Data
+
+```{r acs-load, message=FALSE}
+acs_vars <- c(
+  ##economic vulnerability
+  median_income        = "B19013_001",
+  poverty_pop          = "B17001_001",  ##population (excluding group quarters)
+  poverty              = "B17001_002",  ##population below poverty line
+  labor_total          = "B23025_003",  ##labor force
+  labor_unemployed     = "B23025_005",
+  gini                 = "B19083_001",  ##measure of income inequality within tract
+  housing_burden_rent  = "B25070_010",  ##renters spending 50%+ on housing
+  housing_burden_mort  = "B25091_011",  ##mortgage holders spending 50%+ on housing
+  no_vehicle_renter    = "B25044_003",
+  no_vehicle_owner     = "B25044_010",
+
+  ##neighborhood stability
+  total_housing        = "B25002_001",  
+  vacant_units         = "B25002_003",  
+  occupied_units       = "B25003_001",  
+  renter_units         = "B25003_003",  ##renter-occupied units vs owner-occupied
+  building_units       = "B25024_001",  ##number of units in building
+
+  ##social disorganization
+  single_parent_f      = "B11012_010",  ##single mother households
+  single_parent_m      = "B11012_015",  ##single father households
+  lang_iso_total       = "C16002_001",  ##total households limited english
+  lang_iso_spanish     = "C16002_004",  ##spanish limited english
+  lang_iso_indoeur     = "C16002_007",  ##other indo-european limited english
+  lang_iso_asian       = "C16002_010",  ##asian/pacific island limited english
+  lang_iso_other       = "C16002_013",  ##other languages limited english
+  internet_access      = "B28002_002",  ##households with internet
+  
+  ##demographics
+  total_pop            = "B01003_001",
+  median_age           = "B01002_001",
+  household_size       = "B25010_001",
+  white                = "B03002_003",  
+  black                = "B03002_004",
+  native               = "B03002_005",
+  asian                = "B03002_006",
+  pacific_islander     = "B03002_007",  ##native hawaiian and other pacific islander
+  other_race           = "B03002_008",
+  two_or_more          = "B03002_009",  ##two or more races
+  hispanic             = "B03002_012",  ##mutually exclusive with race categories
+  edu_total            = "B15003_001",  ##total population 25 and over
+  edu_no_hs            = "B15003_002",  ##no schooling completed
+  edu_9th              = "B15003_013",  
+  edu_10th             = "B15003_014",  
+  edu_11th             = "B15003_015",  
+  edu_12th             = "B15003_016",   
+  edu_hs_diploma       = "B15003_017",
+  edu_ged              = "B15003_018",  ##GED or alternative credential
+  edu_some_college     = "B15003_019",  ##some college less than 1 year
+  edu_some_college_m   = "B15003_020",  ##some college 1 or more years no degree
+  edu_associates       = "B15003_021",
+  edu_bachelors        = "B15003_022",
+  edu_masters          = "B15003_023",
+  edu_professional     = "B15003_024",  ##professional school degree
+  edu_doctorate        = "B15003_025",
+  disability_min       = "B18135_003",  ##under 19 with a disability
+  disability_mid       = "B18135_014",  ##19-64 with a disability
+  disability_eld       = "B18135_025",  ##65+ with a disability
+  disability_pop       = "B18135_001"   ##total noninstitutionalized population
+)
+
+##only pull from API if raw file doesn't already exist
+if (!file.exists("output/acs_raw.rds")) {
+  census_api_key(Sys.getenv("CENSUS_API_KEY"))
+  acs_raw <- get_acs(
+    geography = "tract",
+    variables = acs_vars,
+    state     = "CA",
+    county    = "Los Angeles",
+    year      = 2024,
+    survey    = "acs5",
+    geometry  = TRUE
+  )
+  saveRDS(acs_raw, "output/acs_raw.rds")
+  cat("ACS data downloaded and saved.\n")
+} else {
+  acs_raw <- readRDS("output/acs_raw.rds")
+  cat("ACS data loaded from cache.\n")
+}
+
+head(acs_raw)
+```
+
+## Flag Unreliable Estimates
+
+**Note:** Several variables show high rates of unreliable estimates across census tracts, particularly small subgroup counts. This is expected in small-population tracts, but should be interpreted with caution.
+
+```{r acs-moe}
+##flag variables where margin of error exceeds 50% of the estimate
+moe_check <- acs_raw |>
+  st_drop_geometry() |>
+  filter(!is.na(estimate), estimate != 0) |>
+  mutate(moe_pct = moe / estimate) |>
+  filter(moe_pct > 0.5) |>
+  count(variable, name = "n_unreliable") |>
+  arrange(desc(n_unreliable))
+
+cat("Variables with unreliable estimates (MOE > 50%):\n")
+knitr::kable(moe_check, col.names = c("Variable", "Tracts with Unreliable Estimates"))
+```
+
+## Reshape Data
+
+```{r acs-reshape}
+##pivot acs data to wide so each tract is one row
+acs <- acs_raw |>
+  select(GEOID, NAME, variable, estimate, geometry) |>
+  pivot_wider(names_from = variable, values_from = estimate)
+```
+
+## Remove Zero Population Tracts
+
+```{r acs-zero-pop}
+n_before <- nrow(acs)
+
+acs <- acs |>
+  filter(!is.na(total_pop) & total_pop > 0)
+
+cat("Zero/null population tracts removed: ", n_before - nrow(acs), "\n",
+    "Remaining tracts:                    ", nrow(acs), "\n",
+    sep = "")
+```
+
+## Derive Variables
+
+```{r acs-derive}
+acs <- acs |>
+  mutate(
+    ##economic vulnerability
+    poverty_rate         = poverty / poverty_pop,
+    unemployment_rate    = labor_unemployed / labor_total,
+    no_vehicle_rate      = (no_vehicle_renter + no_vehicle_owner) / occupied_units,
+    housing_burden_rate  = ((housing_burden_rent + housing_burden_mort) / occupied_units),
+
+    ##neighborhood stability
+    vacancy_rate         = vacant_units / total_housing,
+    renter_rate          = renter_units / occupied_units,
+
+    ##social disorganization
+    single_parent_rate   = (single_parent_f + single_parent_m) / occupied_units,
+    lang_isolation_rate  = (lang_iso_spanish + lang_iso_indoeur +
+                            lang_iso_asian + lang_iso_other) / lang_iso_total,
+    internet_rate        = internet_access / occupied_units,
+
+    ##demographics
+    pct_white            = white / total_pop,
+    pct_black            = black / total_pop,
+    pct_native           = native / total_pop,
+    pct_asian            = asian / total_pop,
+    pct_pacific          = pacific_islander / total_pop,
+    pct_other            = other_race / total_pop,
+    pct_two_or_more      = two_or_more / total_pop,
+    pct_hispanic         = hispanic / total_pop,
+    edu_rate_no_hsdip    = (edu_no_hs + edu_9th + edu_10th + edu_11th + 
+                            edu_12th) / edu_total,
+    edu_rate_hs          = (edu_hs_diploma + edu_ged) / edu_total,
+    edu_rate_some_col    = (edu_some_college + edu_some_college_m + 
+                            edu_associates) / edu_total,
+    edu_rate_college     = (edu_bachelors + edu_masters + edu_professional + 
+                            edu_doctorate) / edu_total,
+    disability_rate      = (disability_min + disability_mid + 
+                            disability_eld) / disability_pop
+  )
+```
+
+## Check Missing Values
+
+```{r acs-missing, echo = FALSE}
+acs |>
+  st_drop_geometry() |>
+  summarise(across(everything(), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing)) |>
+  knitr::kable(col.names = c("Variable", "Missing Values"))
+```
+
+## Impute Missing Values
+
+```{r m-imputation, warning = FALSE}
+##multiple imputation for missing acs predictors
+acs_imp <- acs |>
+  st_drop_geometry() |>
+  select(GEOID, median_income, gini, no_vehicle_rate, housing_burden_rate, 
+         vacancy_rate, renter_rate, single_parent_rate, lang_isolation_rate, 
+         internet_rate, poverty_rate, unemployment_rate, disability_rate, 
+         median_age, edu_rate_no_hsdip, edu_rate_college) |>
+  mice(m = 5, method = "pmm", seed = 094, printFlag = FALSE)
+
+imp_check <- lapply(1:5, function(i) {
+  complete(acs_imp, i) |>
+    filter(is.na(acs |> st_drop_geometry() |> pull(median_income)) |
+           is.na(acs |> st_drop_geometry() |> pull(gini))) |>
+    summarise(
+      dataset       = i,
+      median_income_mean = mean(median_income, na.rm = TRUE),
+      median_income_sd   = sd(median_income,   na.rm = TRUE),
+      gini_mean          = mean(gini,          na.rm = TRUE),
+      gini_sd            = sd(gini,            na.rm = TRUE)
+    )
+}) |>
+  bind_rows()
+
+knitr::kable(imp_check, digits = 4,
+             col.names = c("Dataset", "Income Mean", "Income SD",
+                           "Gini Mean", "Gini SD"))
+
+acs_imputed <- complete(acs_imp, 1) |>
+  select(GEOID, median_income, gini, no_vehicle_rate, housing_burden_rate, 
+         vacancy_rate, renter_rate, single_parent_rate, lang_isolation_rate, 
+         internet_rate, poverty_rate, unemployment_rate, disability_rate, 
+         median_age, edu_rate_no_hsdip, edu_rate_college)
+acs <- acs |>
+  select(-any_of(names(acs_imputed)[names(acs_imputed) != "GEOID"])) |>
+  left_join(acs_imputed, by = "GEOID")
+
+cat("Missing values after imputation: ",
+    sum(is.na(acs |> st_drop_geometry() |>
+                select(median_income, gini, no_vehicle_rate, housing_burden_rate, 
+                       vacancy_rate, renter_rate, single_parent_rate, 
+                       lang_isolation_rate, internet_rate, poverty_rate))), "\n")
+```    
+   
+\newpage
+
+## Drop Raw Input Variables
+
+```{r acs-cleanup}
+##drop raw acs input variables used only to compute derived rates
+acs_raw_vars_drop <- c(
+  ##economic vulnerability inputs
+  "poverty", "poverty_pop", "labor_total", "labor_unemployed","housing_burden_rent",
+  "housing_burden_mort", "no_vehicle_renter", "no_vehicle_owner",
+
+  ##neighborhood stability inputs
+  "total_housing", "vacant_units", "occupied_units", "renter_units",
+
+  ##social disorganization inputs
+  "single_parent_f", "single_parent_m", "lang_iso_total", "lang_iso_spanish",
+  "lang_iso_indoeur", "lang_iso_asian", "lang_iso_other", "internet_access",
+
+  ##demographics inputs
+  "white", "black", "native", "asian", "pacific_islander",
+  "other_race", "two_or_more", "hispanic",
+
+  ##education inputs
+  "edu_total", "edu_no_hs", "edu_9th", "edu_10th", "edu_11th",
+  "edu_12th", "edu_hs_diploma", "edu_ged", "edu_some_college",
+  "edu_some_college_m", "edu_associates", "edu_bachelors",
+  "edu_masters", "edu_professional", "edu_doctorate",
+
+  ##disability inputs
+  "disability_min", "disability_mid", "disability_eld", "disability_pop"
+)
+
+acs <- acs |>
+  select(-any_of(acs_raw_vars_drop))
+
+cat("Raw input variables dropped: ", length(acs_raw_vars_drop), "\n",
+    "Remaining ACS columns:       ", ncol(acs) - 2, "\n", 
+    sep = "")
+```
+
+## Export Clean ACS Data
+
+```{r acs-export, echo = FALSE}
+if (!file.exists("output/acs_clean.rds")) {
+  saveRDS(acs, "output/acs_clean.rds")
+  acs |>
+    st_drop_geometry() |>
+    write_csv("output/acs_clean.csv")
+  cat("Files saved to /output:\n",
+      "                        acs_clean.rds\n",
+      "                        acs_clean.csv\n",
+      sep = "")
+} else {
+  cat("Output files already exist - skipping export.\n")
+}
+```
+
+\newpage
+
+# Join and Aggregate Data
+
+## Convert LAPD to Spatial Points
+
+```{r convert-and-align}
+##convert lapd lat/lon to sf point geometry using WGS84 (EPSG:4326)
+lapd_sf <- lapd |>
+  st_as_sf(coords = c("lon_clean", "lat_clean"), crs = 4326)
+
+##align crs if needed
+if (st_crs(lapd_sf) != st_crs(acs)) {
+  acs <- st_transform(acs, st_crs(lapd_sf))
+}
+```
+
+## Spatial Join
+
+```{r spatial-join}
+##join each lapd incident to the census tract it falls within
+lapd_joined <- st_join(lapd_sf, acs |> select(GEOID, NAME), left = TRUE)
+
+##check how many incidents didn't match a tract
+n_unmatched <- sum(is.na(lapd_joined$GEOID))
+cat("Incidents matched to a tract:   ", nrow(lapd_joined) - n_unmatched, "\n",
+    "Incidents with no tract match:  ", n_unmatched, "\n", 
+    sep = "")
+```
+
+## Build RQ1 Incident-Level Dataset
+
+RQ1 — *How do neighborhood-level socioeconomic characteristics predict whether a crime incident is violent or property-related?* — requires an incident-level dataset where each row is a single crime, the outcome is a binary violent/property flag, and the ACS socioeconomic characteristics of the incident's census tract serve as predictors. Drug, weapons-only, and other incidents that are neither violent nor property crimes are excluded.
+
+```{r rq1-build}
+##join acs socioeconomic predictors to each incident by tract geoid
+##exclude incidents classified as Other (not violent or property)
+incident_data <- lapd_joined |>
+  st_drop_geometry() |>
+  filter(!is.na(GEOID), crime_type != "Other") |>
+  left_join(
+    acs |>
+      st_drop_geometry() |>
+      select(
+        GEOID,
+        ##economic vulnerability
+        median_income, gini, poverty_rate, unemployment_rate,
+        no_vehicle_rate, housing_burden_rate,
+        ##neighborhood stability
+        vacancy_rate, renter_rate,
+        ##social disorganization
+        single_parent_rate, lang_isolation_rate, internet_rate,
+        ##demographics
+        total_pop, median_age,
+        pct_white, pct_black, pct_asian, pct_hispanic,
+        ##education and disability
+        edu_rate_no_hsdip, edu_rate_college,
+        disability_rate
+      ),
+    by = "GEOID"
+  ) |>
+  ##drop rows where acs predictors couldn't be joined (tracts outside la county acs pull)
+  filter(!is.na(median_income)) |>
+  mutate(
+    ##binary outcome: 1 = violent, 0 = property
+    outcome = as.integer(is_violent),
+
+    ##multiclass outcome: collapsed crime category as factor
+    outcome_multi = factor(case_when(
+      crime_category %in% c("Homicide", "Weapons", "Arson")   ~ "Other Violent",
+      crime_category %in% c("Sexual Assault", "Sex Offenses") ~ "Sexual Offenses",
+      TRUE                                                     ~ crime_category
+    ))
+  ) |>
+  select(
+    rpt_no, date_occ, crime_cd, crime_category,
+    crime_type, is_violent, is_property, outcome, outcome_multi,
+    GEOID,
+    median_income, gini, poverty_rate, unemployment_rate,
+    no_vehicle_rate, housing_burden_rate,
+    vacancy_rate, renter_rate,
+    single_parent_rate, lang_isolation_rate, internet_rate,
+    total_pop, median_age,
+    pct_white, pct_black, pct_asian, pct_hispanic,
+    edu_rate_no_hsdip, edu_rate_college,
+    disability_rate
+  )
+
+cat("RQ1 incident-level dataset:\n",
+    "  Total incidents (violent + property): ", nrow(incident_data),      "\n",
+    "  Violent:                              ", sum(incident_data$is_violent),  "\n",
+    "  Property:                             ", sum(incident_data$is_property), "\n",
+    "  Unique tracts:                        ", n_distinct(incident_data$GEOID), "\n",
+    sep = "")
+```
+
+```{r rq1-export}
+if (!file.exists("output/incident_data.rds")) {
+  saveRDS(incident_data, "output/incident_data.rds")
+  write_csv(incident_data, "output/incident_data.csv")
+  cat("Files saved to /output:\n",
+      "                         incident_data.rds\n",
+      "                         incident_data.csv\n",
+      sep = "")
+} else {
+  cat("Output files already exist - skipping export.\n")
+}
+```
+
+\newpage
+
+## Aggregate to Tract Level for RQ2
+
+```{r join-aggregate}
+crime_by_tract <- lapd_joined |>
+  st_drop_geometry() |>
+  filter(!is.na(GEOID)) |>
+  group_by(GEOID) |>
+  summarise(
+    total_incidents      = n(),
+
+    ##crime category counts
+    n_homicide           = sum(crime_category == "Homicide",        na.rm = TRUE),
+    n_robbery            = sum(crime_category == "Robbery",         na.rm = TRUE),
+    n_assault            = sum(crime_category == "Assault",         na.rm = TRUE),
+    n_simple_assault     = sum(crime_category == "Simple Assault",  na.rm = TRUE),
+    n_sexual_assault     = sum(crime_category == "Sexual Assault",  na.rm = TRUE),
+    n_sex_offenses       = sum(crime_category == "Sex Offenses",    na.rm = TRUE),
+    n_burglary           = sum(crime_category == "Burglary",        na.rm = TRUE),
+    n_theft              = sum(crime_category == "Theft",           na.rm = TRUE),
+    n_vehicle_theft      = sum(crime_category == "Vehicle Theft",   na.rm = TRUE),
+    n_shoplifting        = sum(crime_category == "Shoplifting",     na.rm = TRUE),
+    n_vandalism          = sum(crime_category == "Vandalism",       na.rm = TRUE),
+    n_drug               = sum(crime_category == "Drug/Narcotic",   na.rm = TRUE),
+    n_weapons            = sum(crime_category == "Weapons",         na.rm = TRUE),
+    n_arson              = sum(crime_category == "Arson",           na.rm = TRUE),
+    n_other              = sum(crime_category == "Other",           na.rm = TRUE),
+
+    ##violent crime count
+    n_violent            = sum(is_violent, na.rm = TRUE),
+   
+    ##clearance counts
+    n_arrested      = sum(case_status %in% c("Adult Arrest", "Juv Arrest"), na.rm = TRUE),
+    n_cleared_other = sum(case_status %in% c("Adult Other",  "Juv Other"),  na.rm = TRUE),
+
+    .groups = "drop"
+  )
+```
+
+\newpage
+
+## Compute Crime Rates
+
+```{r join-rates}
+crime_by_tract <- crime_by_tract |>
+  left_join(acs |> st_drop_geometry() |> select(GEOID, total_pop), by = "GEOID") |>
+  mutate(
+    rate_total          = (total_incidents  / total_pop / 5) * 1000,
+    rate_violent        = (n_violent        / total_pop / 5) * 1000,
+    rate_homicide       = (n_homicide       / total_pop / 5) * 1000,
+    rate_robbery        = (n_robbery        / total_pop / 5) * 1000,
+    rate_assault        = (n_assault        / total_pop / 5) * 1000,
+    rate_simple_assault = (n_simple_assault / total_pop / 5) * 1000,
+    rate_sexual_assault = (n_sexual_assault / total_pop / 5) * 1000,
+    rate_sex_offenses   = (n_sex_offenses   / total_pop / 5) * 1000,
+    rate_burglary       = (n_burglary       / total_pop / 5) * 1000,
+    rate_theft          = (n_theft          / total_pop / 5) * 1000,
+    rate_vehicle_theft  = (n_vehicle_theft  / total_pop / 5) * 1000,
+    rate_shoplifting    = (n_shoplifting    / total_pop / 5) * 1000,
+    rate_vandalism      = (n_vandalism      / total_pop / 5) * 1000, 
+    rate_drug           = (n_drug           / total_pop / 5) * 1000,
+    rate_weapons        = (n_weapons        / total_pop / 5) * 1000,
+    rate_arson          = (n_arson          / total_pop / 5) * 1000
+  ) |>
+  select(-total_pop)
+```
+
+## Join ACS Variables
+
+```{r join-acs}
+##join aggregated crime data to full acs dataset by tract
+tract_data <- acs |>
+  left_join(crime_by_tract, by = "GEOID") |>
+  ##replace NA crime counts and rates for tracts with no matched incidents
+  mutate(
+    total_incidents = replace_na(total_incidents, 0),
+    across(starts_with("n_"),    \(x) replace_na(x, 0)),
+    across(starts_with("rate_"), \(x) replace_na(x, 0))
+  )
+```
+
+## Filter to City of Los Angeles
+
+```{r filter-city, message=FALSE, warning=FALSE}
+##city of los angeles boundary
+if (!file.exists("output/la_city_boundary.rds")) {
+  la_city <- places(state = "CA", cb = TRUE) |>
+    filter(NAME == "Los Angeles") |>
+    st_transform(st_crs(tract_data))
+  saveRDS(la_city, "output/la_city_boundary.rds")
+  cat("City boundary downloaded and saved.\n")
+} else {
+  la_city <- readRDS("output/la_city_boundary.rds")
+  cat("City boundary loaded from cache.\n")
+}
+```
+
+\newpage
+
+```{r filter-city-2}
+##keep tracts that intersect the city boundary
+n_before <- nrow(tract_data)
+tract_data <- tract_data |>
+  filter(lengths(st_intersects(geometry, la_city)) > 0)
+
+cat("Tracts outside City of LA removed: ", n_before - nrow(tract_data), "\n",
+    "Remaining tracts:                  ", nrow(tract_data), "\n",
+     sep = "")
+```
+
+## Tract Flags
+
+```{r flag-unusual-tracts}
+##tracts where rates may be unstable
+tract_data <- tract_data |>
+  mutate(
+    flag_small_pop    = total_pop < 500,
+    flag_zero_crime   = total_incidents == 0,
+    flag_extreme_rate = rate_total > mean(rate_total, na.rm = TRUE) + 
+                        3 * sd(rate_total, na.rm = TRUE)
+  )
+
+cat("Small population tracts (<500):  ", sum(tract_data$flag_small_pop),   "\n",
+    "Zero incident tracts:            ", sum(tract_data$flag_zero_crime),   "\n",
+    "Extreme rate tracts (3 SD):      ", sum(tract_data$flag_extreme_rate), "\n",
+    sep = "")
+```
+
+## Check Join Results
+
+```{r join-check}
+cat("Total tracts in final dataset:        ", nrow(tract_data), "\n",
+    "Tracts with zero incidents:           ", sum(tract_data$total_incidents == 0,
+                                              na.rm = TRUE), "\n",
+    "Tracts with missing crime rates:      ", sum(is.na(tract_data$rate_total)),  "\n",
+    sep = "")
+```
+
+\newpage
+
+## Zero-Incident Tract Details
+
+```{r tract-pop}
+##inspect zero-incident tracts to assess cause
+zero_crime_tracts <- tract_data |>
+  st_drop_geometry() |>
+  filter(flag_zero_crime) |>
+  select(GEOID, NAME, total_pop, flag_small_pop) |>
+  arrange(total_pop)
+
+cat("Zero-incident tracts with small population (<500): ",
+    sum(zero_crime_tracts$flag_small_pop), " of ",
+    nrow(zero_crime_tracts), "\n",
+    sep = "")
+
+knitr::kable(zero_crime_tracts,
+             col.names = c("GEOID", "Name", "Total Population", "Small Pop Flag"))
+
+```
+ 
+## Remove Zero-Incident and Small Population Tracts
+
+```{r remove-zero-crime}
+n_before <- nrow(tract_data)
+
+tract_data <- tract_data |>
+  filter(!flag_zero_crime, !flag_small_pop)
+
+cat("Tracts removed: ", n_before - nrow(tract_data), "\n",
+    "Remaining tracts:             ", nrow(tract_data), "\n",
+    sep = "")
+```
+
+\newpage
+
+# Variable Selection
+
+## Crime Variables
+
+```{r crime-var-selection}
+##create aggregate property rate for rq2 spatial analysis
+tract_data <- tract_data |>
+  mutate(
+    rate_property = rate_burglary + rate_theft + rate_vehicle_theft +
+                    rate_shoplifting + rate_vandalism
+  )
+
+##drop individual category counts and rates not used in modeling or eda
+crime_vars_drop <- c(
+  "n_homicide", "n_robbery", "n_assault", "n_simple_assault",
+  "n_sexual_assault", "n_sex_offenses", "n_burglary", "n_theft",
+  "n_vehicle_theft", "n_shoplifting", "n_vandalism", "n_drug",
+  "n_weapons", "n_arson", "n_other",
+  
+  "rate_homicide", "rate_robbery", "rate_assault", "rate_simple_assault",
+  "rate_sexual_assault", "rate_sex_offenses", "rate_burglary", "rate_theft",
+  "rate_vehicle_theft", "rate_shoplifting", "rate_vandalism",
+  "rate_weapons", "rate_arson"
+)
+
+tract_data <- tract_data |>
+  select(-any_of(crime_vars_drop))
+
+cat("Variables dropped:          ", length(crime_vars_drop), "\n",
+    "Remaining crime variables:  ", tract_data |> st_drop_geometry() |>
+      select(starts_with("n_"), starts_with("rate_"), "total_incidents") |>
+      ncol(), "\n",
+    sep = "")
+```
+
+## ACS Variables
+
+### Check Near Zero Variance
+
+```{r acs-near-zero-variance}
+##check variance of all acs predictor rates across tracts
+acs_predictors <- tract_data |>
+  st_drop_geometry() |>
+  select(
+    median_income, gini, poverty_rate, unemployment_rate,
+    no_vehicle_rate, housing_burden_rate, vacancy_rate, renter_rate,
+    building_units, single_parent_rate, lang_isolation_rate, internet_rate,
+    total_pop, median_age, household_size,
+    pct_white, pct_black, pct_native, pct_asian, pct_pacific,
+    pct_other, pct_two_or_more, pct_hispanic,
+    edu_rate_no_hsdip, edu_rate_hs, edu_rate_some_col, edu_rate_college,
+    disability_rate
+  )
+
+##compute variance and basic distribution stats for each variable
+var_summary <- acs_predictors |>
+  summarise(across(everything(), list(
+    variance  = \(x) var(x, na.rm = TRUE),
+    sd        = \(x) sd(x, na.rm = TRUE),
+    mean      = \(x) mean(x, na.rm = TRUE),
+    pct_zero  = \(x) mean(x < 0.01, na.rm = TRUE)
+  ))) |>
+  pivot_longer(
+    everything(),
+    names_to  = c("variable", ".value"),
+    names_pattern = "(.*)_(variance|sd|mean|pct_zero)"
+  ) |>
+  arrange(variance)
+
+knitr::kable(var_summary, 
+             digits = 4,
+             col.names = c("Variable", "Variance", "SD", "Mean", "Proportion Near Zero"))
+```
+
+\newpage
+
+### Check Highly Correlated Variables
+
+```{r acs-correlation}
+acs_pred <- tract_data |>
+  st_drop_geometry() |>
+  select(
+    median_income, gini, poverty_rate, unemployment_rate,
+    no_vehicle_rate, housing_burden_rate, vacancy_rate, renter_rate,
+    single_parent_rate, lang_isolation_rate, internet_rate,
+    median_age, household_size,
+    pct_white, pct_black, pct_two_or_more, pct_asian, pct_hispanic,
+    edu_rate_no_hsdip, edu_rate_hs, edu_rate_some_col, edu_rate_college,
+    disability_rate
+  )
+
+acs_cor <- cor(acs_pred, use = "pairwise.complete.obs")
+
+##flag highly correlated pairs
+acs_cor_long <- acs_cor |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation") |>
+  filter(var1 < var2, abs(correlation) > 0.70) |>
+  arrange(desc(abs(correlation)))
+
+cat("Highly correlated pairs (|r| > 0.70):\n")
+knitr::kable(acs_cor_long,
+             digits = 3,
+             col.names = c("Variable 1", "Variable 2", "Correlation"))
+```
+
+\newpage
+
+### Select ACS Variables 
+
+```{r acs-var-selection}
+acs_vars_drop <- c(
+  ##near-zero variance
+  "building_units",
+  "pct_pacific",
+  "pct_native",
+  "pct_other",
+  "pct_two_or_more",
+  
+  ##multicollinearity / redundancy
+  "household_size",
+  "edu_rate_hs",
+  "edu_rate_some_col"
+)
+
+tract_data <- tract_data |>
+  select(-any_of(acs_vars_drop))
+
+cat("ACS variables dropped:     ", length(acs_vars_drop), "\n",
+    "Remaining ACS predictors:  ", tract_data |>
+      st_drop_geometry() |>
+      select(median_income, gini, poverty_rate, unemployment_rate,
+             no_vehicle_rate, housing_burden_rate, vacancy_rate, renter_rate,
+             single_parent_rate, lang_isolation_rate, internet_rate,
+             total_pop, median_age, pct_white, pct_black, pct_asian, 
+             pct_hispanic, edu_rate_no_hsdip, edu_rate_college,
+             disability_rate) |>
+      ncol(), "\n",
+    sep = "")
+```
+
+## Export Dataset
+
+```{r join-export, echo = FALSE}
+if (!file.exists("output/tract_data.rds")) {
+  saveRDS(tract_data, "output/tract_data.rds")
+  tract_data |>
+    st_drop_geometry() |>
+    write_csv("output/tract_data.csv")
+  cat("Files saved to /output:\n",
+      "                        tract_data.rds\n",
+      "                        tract_data.csv\n",
+      sep = "")
+} else {
+  cat("Output files already exist - skipping export.\n")
+}
+```
+
+\newpage
+
+# Final Dataset Overview
+
+```{r overview-dims}
+cat("incident_data (incident-level, RQ1):\n",
+    "  Rows:    ", nrow(incident_data),    "\n",
+    "  Columns: ", ncol(incident_data),    "\n\n",
+    "tract_data (tract-level, RQ2):\n",
+    "  Rows:    ", nrow(tract_data),  "\n",
+    "  Columns: ", ncol(tract_data),  "\n",
+    sep = "")
+```
+
+## Tract Flags
+
+```{r overview-flags, echo=FALSE}
+tibble(
+  Variable = c(
+    "flag_small_pop",
+    "flag_zero_crime",
+    "flag_extreme_rate"
+  ),
+  Description = c(
+    "Tract population below 500 (crime rates may be unstable)",
+    "Tract had zero matched incidents 2020–2024",
+    "Total crime rate exceeds 3 standard deviations above the mean"
+  )
+) |>
+  knitr::kable(col.names = c("Variable", "Description"))
+```
+
+**Note:** 58 of 59 zero-crime tracts have populations above 500, suggesting 
+these zeros reflect a spatial join artifact at the city boundary rather than 
+genuine absence of crime. These tracts were excluded from the final dataset. Tracts with fewer than 500 residents were also excluded due to unstable crime rates.
+
+## Tract-Level Crime Variables (`tract_data`)
+
+```{r overview-crime, echo=FALSE}
+tibble(
+  Variable = c(
+    ##spatial analysis outcomes
+    "total_incidents", "n_violent",
+    ##rates used in spatial analysis
+    "rate_total", "rate_violent", "rate_property", "rate_drug",
+    ##descriptive
+    "n_arrested", "n_cleared_other"
+  ),
+  Type = c(
+    rep("Count", 2),
+    rep("Rate (per 1,000)", 4),
+    rep("Count", 2)
+  ),
+  Description = c(
+    "Total incidents 2020–2024",
+    "Total violent crime incidents",
+    "Total incident rate",
+    "Violent incident rate",
+    "Property crime rate",
+    "Drug/narcotic incident rate",
+    "Total arrests",
+    "Total cases closed for other reasons"
+  )
+) |>
+  knitr::kable(col.names = c("Variable", "Type", "Description")) |>
+  kableExtra::pack_rows("Spatial Analysis Outcomes", 1, 2) |>
+  kableExtra::pack_rows("Spatial Analysis Rates", 3, 6) |>
+  kableExtra::pack_rows("Descriptive", 7, 8)
+```
+
+\newpage
+
+## RQ1 Incident-Level Variables (`incident_data`)
+
+```{r overview-rq1, echo=FALSE}
+tibble(
+  Variable = c(
+    "rpt_no", "date_occ",
+    "crime_cd", "crime_category", "crime_type",
+    "is_violent", "is_property", "outcome", "outcome_multi",
+    "GEOID",
+    "median_income", "gini", "poverty_rate", "unemployment_rate",
+    "no_vehicle_rate", "housing_burden_rate",
+    "vacancy_rate", "renter_rate",
+    "single_parent_rate", "lang_isolation_rate", "internet_rate",
+    "total_pop", "median_age",
+    "pct_white", "pct_black", "pct_asian", "pct_hispanic",
+    "edu_rate_no_hsdip", "edu_rate_college",
+    "disability_rate"
+  ),
+  Description = c(
+    "LAPD report number",
+    "Date of occurrence",
+    "LAPD crime code",
+    "Detailed crime category",
+    "Violent / Property",
+    "TRUE if violent crime",
+    "TRUE if property crime",
+    "Binary outcome: 1 = violent, 0 = property",
+    "Multiclass outcome: specific crime category as factor",
+    "Census tract GEOID (links to ACS predictors)",
+    "Median household income",
+    "Gini coefficient",
+    "Proportion population below poverty line",
+    "Proportion labor force unemployed",
+    "Proportion households with no vehicle",
+    "Proportion 50%+ of income on housing",
+    "Proportion housing units vacant",
+    "Proportion housing units renter-occupied",
+    "Proportion households with single parent",
+    "Proportion with limited English proficiency",
+    "Proportion households with internet access",
+    "Total tract population",
+    "Median age of residents",
+    "Proportion non-Hispanic white",
+    "Proportion non-Hispanic Black",
+    "Proportion non-Hispanic Asian",
+    "Proportion Hispanic or Latino",
+    "Proportion with less than high school diploma",
+    "Proportion with bachelor's degree or higher",
+    "Proportion with a disability"
+  )
+) |>
+  knitr::kable(col.names = c("Variable", "Description")) |>
+  kableExtra::pack_rows("Incident Identifiers", 1, 2) |>
+  kableExtra::pack_rows("Crime Classification", 3, 5) |>
+  kableExtra::pack_rows("Outcome Variables", 6, 9) |>
+  kableExtra::pack_rows("Geography", 10, 10) |>
+  kableExtra::pack_rows("Economic Vulnerability", 11, 16) |>
+  kableExtra::pack_rows("Neighborhood Stability", 17, 18) |>
+  kableExtra::pack_rows("Social Disorganization", 19, 21) |>
+  kableExtra::pack_rows("Demographics", 22, 27) |>
+  kableExtra::pack_rows("Education & Disability", 28, 30)
+```
+
+\newpage
+
+## Tract-Level ACS Variables (`tract_data`)
+
+```{r overview-acs, echo=FALSE}
+tibble(
+  Variable = c(
+    ##economic vulnerability
+    "median_income", "gini", "poverty_rate", "unemployment_rate",
+    "no_vehicle_rate", "housing_burden_rate",
+    ##neighborhood stability
+    "vacancy_rate", "renter_rate",
+    ##social disorganization
+    "single_parent_rate", "lang_isolation_rate", "internet_rate",
+    ##demographics
+    "total_pop", "median_age",
+    "pct_white", "pct_black", "pct_asian", "pct_hispanic",
+    ##education
+    "edu_rate_no_hsdip", "edu_rate_college",
+    ##disability
+    "disability_rate"
+  ),
+  Description = c(
+    "Median household income",
+    "Gini coefficient (0 = equal, 1 = unequal)",
+    "Proportion population below poverty line",
+    "Proportion labor force unemployed",
+    "Proportion households with no vehicle",
+    "Proportion 50%+ of income on housing",
+    "Proportion housing units vacant",
+    "Proportion housing units renter-occupied",
+    "Proportion households with single parent",
+    "Proportion with limited English proficiency",
+    "Proportion households with internet access",
+    "Total tract population",
+    "Median age of residents",
+    "Proportion non-Hispanic white",
+    "Proportion non-Hispanic Black",
+    "Proportion non-Hispanic Asian",
+    "Proportion Hispanic or Latino",
+    "Proportion with less than high school diploma",
+    "Proportion with bachelor's degree or higher",
+    "Proportion with a disability"
+  )
+) |>
+  knitr::kable(col.names = c("Variable", "Description")) |>
+  kableExtra::pack_rows("Economic Vulnerability", 1, 6) |>
+  kableExtra::pack_rows("Neighborhood Stability", 7, 8) |>
+  kableExtra::pack_rows("Social Disorganization", 9, 11) |>
+  kableExtra::pack_rows("Demographics", 12, 17) |>
+  kableExtra::pack_rows("Education", 18, 19) |>
+  kableExtra::pack_rows("Disability", 20, 20)
+```

@@ -1,0 +1,989 @@
+---
+title: "EDA"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(sf)
+library(here)
+library(tmap)
+
+tmap_mode("plot")
+
+##IBM Carbon colorblind-safe palette
+ibm_blue    <- "#648FFF"
+ibm_purple  <- "#785EF0"
+ibm_magenta <- "#DC267F"
+ibm_orange  <- "#FE6100"
+ibm_gold    <- "#FFB000"
+
+##load incident-level data for rq1
+incident_data <- readRDS(here("output", "incident_data.rds"))
+
+##load tract data for rq2
+tract_data <- readRDS(here("output", "tract_data.rds"))
+tract_data <- tract_data |>
+  mutate(arrest_ratio = n_arrested / total_incidents)
+
+##crime labels
+crime_rate_labels <- c(
+  rate_total      = "Total Crime",
+  rate_violent    = "Violent Crime",
+  rate_property   = "Property Crime",
+  rate_drug       = "Drug Crime",
+  total_incidents = "Total Incidents",
+  n_violent       = "Violent Incidents",
+  n_arrested      = "Arrests",
+  n_cleared_other = "Cleared (Other)"
+)
+
+##acs labels
+acs_plot_labels <- c(
+  median_income       = "Median Income",
+  gini                = "Gini Coefficient",
+  poverty_rate        = "Poverty Rate",
+  unemployment_rate   = "Unemployment Rate",
+  no_vehicle_rate     = "No Vehicle Rate",
+  housing_burden_rate = "Housing Burden Rate",
+  vacancy_rate        = "Vacancy Rate",
+  renter_rate         = "Renter Rate",
+  single_parent_rate  = "Single-Parent Rate",
+  lang_isolation_rate = "Language Isolation Rate",
+  internet_rate       = "Internet Access Rate",
+  disability_rate     = "Disability Rate",
+  total_pop           = "Total Population",
+  median_age          = "Median Age",
+  pct_white           = "% White",
+  pct_black           = "% Black",
+  pct_asian           = "% Asian",
+  pct_hispanic        = "% Hispanic",
+  edu_rate_no_hsdip   = "No HS Diploma Rate",
+  edu_rate_college    = "College Degree Rate"
+)
+
+##crime rate vars vector
+crime_rate_vars <- c("rate_total", "rate_violent", "rate_property", "rate_drug")
+
+##acs vars vector
+acs_hist_vars <- c(
+  "median_income", "gini", "poverty_rate", "unemployment_rate",
+  "no_vehicle_rate", "housing_burden_rate", "vacancy_rate", "renter_rate",
+  "single_parent_rate", "lang_isolation_rate", "internet_rate", "disability_rate",
+  "pct_white", "pct_black", "pct_asian", "pct_hispanic",
+  "median_age", "edu_rate_no_hsdip", "edu_rate_college"
+)
+
+kable_style <- function(kbl) {
+  kbl |>
+    kableExtra::kable_styling(
+      latex_options = c("striped", "hold_position", "scale_down"),
+      stripe_color  = "#f5f5f5",
+      font_size     = 10
+    )
+}
+
+##build Subtype color palette in descending size order
+property_order <- incident_data |>
+  filter(crime_type == "Property") |>
+  count(outcome_multi) |>
+  arrange(desc(n)) |>
+  pull(outcome_multi)
+
+violent_order <- incident_data |>
+  filter(crime_type == "Violent") |>
+  count(outcome_multi) |>
+  arrange(desc(n)) |>
+  pull(outcome_multi)
+
+subtype_colors <- setNames(
+  c(ibm_purple, ibm_blue,
+    colorRampPalette(c(ibm_blue, "#00B4D8"))(3)[2],
+    "#00B4D8", "#00CEC8"),
+  property_order
+) |>
+  c(setNames(
+    colorRampPalette(c(ibm_magenta, ibm_orange, ibm_gold))(4),
+    violent_order
+  ))
+
+##ggplot theme
+theme_ibm <- function() {
+  theme_light() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.background = element_rect(fill = "#E8EEFF", color = NA),
+    strip.text       = element_text(face = "bold", size = 10, color = "#1a1a1a"),
+    axis.text        = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+}
+
+##boxplot outlier styling
+boxplot_outlier <- list(
+  outlier.shape = 21, outlier.fill = "white",
+  outlier.color = "gray30", outlier.size = 0.8,
+  outlier.alpha = 0.5
+)
+
+##heatmap theme and fill scale
+theme_heatmap <- theme(
+  axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+  axis.text.y = element_text(size = 7),
+  panel.grid  = element_blank()
+)
+
+heatmap_fill <- scale_fill_gradient2(
+  low      = ibm_purple,
+  mid      = "white",
+  high     = ibm_gold,
+  midpoint = 0,
+  limits   = c(-1, 1)
+)
+
+##choropleth bbox, layout, and styling
+la_bbox <- st_bbox(c(xmin = -118.95, ymin = 33.70,
+                     xmax = -118.10, ymax = 34.35),
+                   crs = st_crs(4326))
+
+tm_map_layout <- function(title) {
+  tm_layout(
+    main.title      = title,
+    main.title.size = 1,
+    legend.outside  = TRUE,
+    frame           = FALSE
+  )
+}
+
+tm_quantile_poly <- function(col, title) {
+  tm_polygons(
+    col        = col,
+    palette    = "plasma",
+    style      = "quantile",
+    n          = 5,
+    title      = title,
+    border.col = NA
+  )
+}
+
+tm_choro <- function(data, col, legend_title, map_title) {
+  tm_shape(data, bbox = la_bbox) +
+    tm_quantile_poly(col, legend_title) +
+    tm_map_layout(map_title)
+}
+```
+
+\newpage
+
+# Data Overview
+
+## LAPD Crime Data 2020-2024
+
+### Descriptive Statistics
+
+```{r crime-desc-stats}
+crime_desc <- tract_data |>
+  st_drop_geometry() |>
+  select(all_of(names(crime_rate_labels))) |>
+  summarise(across(everything(), list(
+    mean   = \(x) mean(x, na.rm = TRUE),
+    median = \(x) median(x, na.rm = TRUE),
+    sd     = \(x) sd(x, na.rm = TRUE),
+    min    = \(x) min(x, na.rm = TRUE),
+    max    = \(x) max(x, na.rm = TRUE)
+  ))) |>
+  pivot_longer(
+    everything(),
+    names_to  = c("variable", ".value"),
+    names_pattern = "(.*)_(mean|median|sd|min|max)"
+  ) |>
+  mutate(variable = crime_rate_labels[variable])
+
+knitr::kable(crime_desc,
+             digits    = 2,
+             col.names = c("Variable", "Mean", "Median", "SD", "Min", "Max"),
+             booktabs  = TRUE,
+             linesep   = "") |>
+  kable_style() |>
+  kableExtra::pack_rows("Rates (per 1,000)", 1, 4,
+                        bold = TRUE, italic = FALSE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Counts",            5, 8,
+                        bold = TRUE, italic = FALSE, background = "#e8e8e8") |>
+  kableExtra::column_spec(1, width = "5cm") |>
+  kableExtra::column_spec(2:6, width = "1.6cm")
+```
+
+### Histograms
+
+```{r crime-hist}
+tract_data |>
+  st_drop_geometry() |>
+  select(all_of(crime_rate_vars)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(variable = factor(crime_rate_labels[variable],
+                           levels = crime_rate_labels[crime_rate_vars])) |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = ibm_blue, color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(
+    title    = "Distribution of Annual Crime Rates Across Census Tracts",
+    subtitle = "All distributions are right-skewed, indicating a small number of high-crime tracts",
+    x        = "Rate (incidents per 1,000 residents per year)",
+    y        = "Number of Tracts"
+  ) +
+  theme_ibm()
+```
+
+### Crime Breakdown
+
+```{r crime-donut}
+donut_colors <- c(
+  "Property" = ibm_purple,
+  "Violent"  = ibm_magenta,
+  subtype_colors
+)
+
+##inner ring: crime type totals — factored to control stacking order
+inner <- incident_data |>
+  count(crime_type) |>
+  mutate(crime_type = factor(crime_type, levels = c("Property", "Violent"))) |>
+  arrange(crime_type) |>
+  mutate(
+    fraction = n / sum(n),
+    ymax     = cumsum(fraction),
+    ymin     = lag(ymax, default = 0),
+    label    = paste0(crime_type, "\n", formatC(n, format = "d", big.mark = ","))
+  )
+
+##outer ring: factored to match inner ring stacking order
+outer <- incident_data |>
+  count(crime_type, outcome_multi) |>
+  mutate(
+    fraction   = n / sum(n),
+    crime_type = factor(crime_type, levels = c("Property", "Violent"))
+  ) |>
+  arrange(crime_type, desc(n)) |>
+  mutate(
+    ymax = cumsum(fraction),
+    ymin = lag(ymax, default = 0)
+  )
+
+ggplot() +
+  ##outer ring
+  geom_rect(data = outer,
+            aes(ymin = ymin, ymax = ymax, xmin = 3.05, xmax = 4.1,
+                fill = outcome_multi)) +
+  ##inner ring
+  geom_rect(data = inner,
+            aes(ymin = ymin, ymax = ymax, xmin = 1.4, xmax = 2.95,
+                fill = crime_type)) +
+  scale_fill_manual(
+    values = donut_colors,
+    breaks = c(property_order, violent_order)
+  ) +
+  coord_polar(theta = "y") +
+  xlim(c(0, 4.1)) +
+  geom_text(data = inner,
+            aes(x = 2.2, y = (ymin + ymax) / 2, label = label),
+            size = 3.5, fontface = "bold", color = "white") +
+  labs(
+    title   = "Incident Composition by Crime Type and Subtype",
+    caption = "Other Violent includes Homicide, Weapons, and Arson. Sexual Offenses includes Sexual Assault and Sex Offenses.",
+    fill    = "Subtype"
+  ) +
+  theme_void() +
+  theme(
+    plot.title   = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.caption = element_text(size = 8, color = "gray40", hjust = 0.5,
+                                margin = margin(t = 10)),
+    plot.margin  = margin(10, 10, 10, 50),
+    legend.title = element_text(face = "bold")
+  )
+```
+
+\newpage
+
+## 2024 5-year American Census Survey Data
+
+### Descriptive Statistics
+
+```{r acs-desc-stats}
+##compute descriptive statistics for acs predictor variables
+acs_desc <- tract_data |>
+  st_drop_geometry() |>
+  select(all_of(names(acs_plot_labels))) |>
+  summarise(across(everything(), list(
+    mean   = \(x) mean(x, na.rm = TRUE),
+    median = \(x) median(x, na.rm = TRUE),
+    sd     = \(x) sd(x, na.rm = TRUE),
+    min    = \(x) min(x, na.rm = TRUE),
+    max    = \(x) max(x, na.rm = TRUE)
+  ))) |>
+  pivot_longer(
+    everything(),
+    names_to  = c("variable", ".value"),
+    names_pattern = "(.*)_(mean|median|sd|min|max)"
+  ) |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    across(c(mean, median, sd, min, max), \(x) {
+      ifelse(variable == "Median Income",
+             formatC(x, format = "f", digits = 0, big.mark = ","),
+             formatC(x, format = "f", digits = 3))
+    })
+  )
+
+knitr::kable(acs_desc,
+             col.names = c("Variable", "Mean", "Median", "SD", "Min", "Max"),
+             booktabs  = TRUE,
+             linesep   = "",
+             align     = c("l", "r", "r", "r", "r", "r")) |>
+  kable_style() |>
+  kableExtra::pack_rows("Economic Vulnerability", 1,  6,
+                        bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Neighborhood Stability",  7,  8,
+                        bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Social Disorganization",  9, 12,
+                        bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Demographics",           13, 18,
+                        bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Education",              19, 20,
+                        bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::column_spec(1, width = "5.5cm") |>
+  kableExtra::column_spec(2:6, width = "1.6cm")
+```
+
+### Histograms
+
+```{r acs-hist, fig.height=8.5}
+##all acs variable distributions in one faceted plot
+tract_data |>
+  st_drop_geometry() |>
+  select(all_of(acs_hist_vars)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(variable = factor(acs_plot_labels[variable],
+                           levels = acs_plot_labels[acs_hist_vars])) |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = ibm_blue, color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Distribution of ACS Predictor Variables Across Census Tracts",
+    x     = "Value",
+    y     = "Number of Tracts"
+  ) +
+  theme_ibm() +
+  theme(axis.text.x = element_text(size = 6),
+        axis.text.y = element_text(size = 6))
+```
+
+## Correlation Heatmaps
+
+### Multicollinearity
+
+```{r acs-correlation-heatmap, fig.height=9, fig.width=9}
+##spearman correlation doesn't assume a linear relationship
+tract_data |>
+  st_drop_geometry() |>
+  select(all_of(acs_hist_vars)) |>
+  cor(use = "pairwise.complete.obs", method = "spearman") |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation") |>
+  mutate(across(c(var1, var2), ~ acs_plot_labels[.])) |>
+  ggplot(aes(x = var1, y = var2, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), size = 2.2) +
+  heatmap_fill +
+  labs(
+    title = "Spearman Correlations Among ACS Predictor Variables",
+    x     = NULL,
+    y     = NULL,
+    fill  = "Correlation"
+  ) +
+  theme_ibm() +
+  theme_heatmap
+```
+
+### ACS Predictors vs. Crime Outcomes
+
+```{r correlation-heatmap}
+tract_data |>
+  st_drop_geometry() |>
+  select(all_of(acs_hist_vars), rate_violent, rate_property, rate_total) |>
+  cor(use = "pairwise.complete.obs", method = "spearman") |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation") |>
+  filter(
+    var1 %in% acs_hist_vars,
+    var2 %in% c("rate_violent", "rate_property")
+  ) |>
+  mutate(
+    var1 = acs_plot_labels[var1],
+    var2 = crime_rate_labels[var2]
+  ) |>
+  ggplot(aes(x = var2, y = var1, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  heatmap_fill +
+  theme_heatmap +
+  labs(
+    title = "Correlation Between ACS Predictors and Crime Outcomes",
+    x     = "Crime Outcome",
+    y     = "ACS Predictor"
+  )
+```
+
+# RQ1: How do neighborhood-level socioeconomic characteristics predict whether a crime incident is violent or property-related in the City of Los Angeles?
+
+## Incident Descriptive Statistics
+
+```{r rq1-desc-stats}
+##property categories in size order
+property_rows <- incident_data |>
+  filter(crime_type == "Property") |>
+  count(crime_category) |>
+  arrange(desc(n)) |>
+  mutate(pct = n / nrow(incident_data) * 100)
+
+##property total
+property_total <- tibble(
+  crime_category = "Total Property",
+  n              = sum(property_rows$n),
+  pct            = sum(property_rows$pct)
+)
+
+##violent categories in size order
+violent_rows <- incident_data |>
+  filter(crime_type == "Violent") |>
+  count(crime_category) |>
+  arrange(desc(n)) |>
+  mutate(pct = n / nrow(incident_data) * 100)
+
+##violent total
+violent_total <- tibble(
+  crime_category = "Total Violent",
+  n              = sum(violent_rows$n),
+  pct            = sum(violent_rows$pct)
+)
+
+##combine in correct order: property categories + total, then violent categories + total
+bind_rows(
+  property_rows,
+  property_total,
+  violent_rows,
+  violent_total
+) |>
+  mutate(
+    n   = formatC(n,   format = "d", big.mark = ","),
+    pct = formatC(pct, format = "f", digits   = 1)
+  ) |>
+  knitr::kable(
+    col.names = c("Subtype", "Count", "%"),
+    booktabs  = TRUE,
+    linesep   = "",
+    align     = c("l", "r", "r")
+  ) |>
+  kable_style() |>
+  kableExtra::pack_rows("Property", 1, nrow(property_rows) + 1) |>
+  kableExtra::pack_rows("Violent",  nrow(property_rows) + 2,
+                        nrow(property_rows) + nrow(violent_rows) + 2)
+```
+
+## Histograms
+
+```{r incident-hist}
+##distribution of crime type proportions across tracts
+##proportions computed relative to violent + property + drug only
+tract_data |>
+  st_drop_geometry() |>
+  mutate(
+    rate_sum     = rate_violent + rate_property + rate_drug,
+    pct_violent  = rate_violent  / rate_sum,
+    pct_property = rate_property / rate_sum,
+    pct_drug     = rate_drug     / rate_sum
+  ) |>
+  select(pct_violent, pct_property, pct_drug) |>
+  pivot_longer(everything(),
+               names_to  = "type",
+               values_to = "proportion") |>
+  mutate(type = case_when(
+    type == "pct_violent"  ~ "Violent",
+    type == "pct_property" ~ "Property",
+    type == "pct_drug"     ~ "Drug"
+  )) |>
+  ggplot(aes(x = proportion, fill = type)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.7,
+                 position = "identity") +
+  scale_fill_manual(values = c(
+    "Violent"  = ibm_magenta,
+    "Property" = ibm_purple,
+    "Drug"     = ibm_gold
+  )) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Distribution of Crime Type Proportions Across Census Tracts",
+    subtitle = "Drug bar truncated at y = 250; full height = 1,140 tracts",
+    x        = "Proportion of Violent, Property, and Drug Incidents",
+    y        = "Number of Tracts",
+    fill     = "Crime Type"
+  ) +
+  coord_cartesian(ylim = c(0, 250)) +
+  theme_ibm()
+```
+
+```{r incident-hist-multi, fig.height=7}
+##distribution of each crime Subtype proportion across tracts
+incident_data |>
+  group_by(GEOID) |>
+  mutate(n_total = n()) |>
+  filter(n_total >= 10) |>
+  group_by(GEOID, outcome_multi, n_total) |>
+  summarise(n_cat = n(), .groups = "drop") |>
+  mutate(proportion = n_cat / n_total,
+         outcome_multi = factor(outcome_multi, 
+                                levels = c(property_order, violent_order))) |>
+  ggplot(aes(x = proportion, fill = outcome_multi)) +
+  geom_histogram(bins = 30, color = "white") +
+  scale_fill_manual(values = subtype_colors) +
+  scale_x_continuous(labels = scales::percent) +
+  facet_wrap(~ outcome_multi, scales = "free", ncol = 3) +
+  labs(
+    title    = "Distribution of Crime Subtype Proportions Across Census Tracts",
+    subtitle = "Tracts with fewer than 10 incidents excluded",
+    x        = "Proportion of Incidents",
+    y        = "Number of Tracts"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+## Box Plot Comparisons by Crime Type
+
+### Economic Vulnerability
+
+```{r econ-box, fig.height=8}
+##economic vulnerability variables by crime type at incident level
+incident_data |>
+  select(crime_type, median_income, gini, poverty_rate,
+         unemployment_rate, no_vehicle_rate, housing_burden_rate) |>
+  pivot_longer(-crime_type, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = crime_type, y = value, fill = crime_type)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Economic Vulnerability by Crime Type",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+### Neighborhood Stability
+
+```{r stab-box, fig.height=2.3}
+##neighborhood stability variables by crime type at incident level
+incident_data |>
+  select(crime_type, vacancy_rate, renter_rate) |>
+  pivot_longer(-crime_type, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = crime_type, y = value, fill = crime_type)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Neighborhood Stability by Crime Type",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+### Social Disorganization
+
+```{r soc-box, fig.height=4.6}
+##social disorganization variables by crime type at incident level
+incident_data |>
+  select(crime_type, single_parent_rate, lang_isolation_rate,
+         internet_rate, disability_rate) |>
+  pivot_longer(-crime_type, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = crime_type, y = value, fill = crime_type)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Social Disorganization by Crime Type",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+### Demographics
+
+```{r demo-box, fig.height=8}
+##demographic variables by crime type at incident level
+incident_data |>
+  select(crime_type, median_age,
+         pct_white, pct_black, pct_asian, pct_hispanic) |>
+  pivot_longer(-crime_type, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = crime_type, y = value, fill = crime_type)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Demographics by Crime Type",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+### Educational Attainment
+
+```{r edu-box, fig.height=2.3}
+##education variables by crime type at incident level
+incident_data |>
+  select(crime_type, edu_rate_no_hsdip, edu_rate_college) |>
+  pivot_longer(-crime_type, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = crime_type, y = value, fill = crime_type)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Educational Attainment by Crime Type",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "none")
+```
+
+### Multi Box
+
+```{r multi-box, fig.height=4.6}
+##top predictors by crime Subtype — establishes acs signal for multiclass modeling
+incident_data |>
+  select(outcome_multi, median_income, no_vehicle_rate, edu_rate_college) |>
+  pivot_longer(-outcome_multi, names_to = "variable", values_to = "value") |>
+  mutate(
+    variable     = acs_plot_labels[variable],
+    outcome_multi = factor(outcome_multi, levels = c(property_order, violent_order))
+  ) |>
+  ggplot(aes(x = outcome_multi, y = value, fill = outcome_multi)) +
+  do.call(geom_boxplot, boxplot_outlier) +
+  scale_fill_manual(values = subtype_colors) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Top ACS Predictors by Crime Subtype",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_ibm() +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(angle = 25, hjust = 1)
+  )
+```
+
+## Scatter Plots
+
+```{r rq1-tract-setup}
+##tract-level violent and property proportions for scatter plots
+tract_violent <- incident_data |>
+  group_by(GEOID) |>
+  summarise(
+    n_total      = n(),
+    pct_violent  = mean(outcome),
+    pct_property = 1 - mean(outcome),
+    across(all_of(acs_hist_vars), first)
+  ) |>
+  filter(n_total >= 10)
+```
+
+### Economic Vulnerability
+
+```{r econ-scatter, fig.height=6}
+##economic vulnerability predictors vs tract violent and property proportions
+tract_violent |>
+  select(pct_violent, pct_property, median_income, gini, poverty_rate,
+         unemployment_rate, no_vehicle_rate, housing_burden_rate) |>
+  pivot_longer(c(pct_violent, pct_property),
+               names_to = "outcome", values_to = "proportion") |>
+  pivot_longer(c(median_income, gini, poverty_rate,
+                 unemployment_rate, no_vehicle_rate, housing_burden_rate),
+               names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    outcome  = case_when(
+      outcome == "pct_violent"  ~ "Violent",
+      outcome == "pct_property" ~ "Property"
+    )
+  ) |>
+  ggplot(aes(x = value, y = proportion, color = outcome)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Economic Vulnerability vs. Crime Type Proportion",
+    x     = "Predictor Value",
+    y     = "Proportion of Incidents",
+    color = "Crime Type"
+  ) +
+  theme_ibm()
+```
+
+### Neighborhood Stability
+
+```{r stab-scatter, fig.height=2}
+##neighborhood stability predictors vs tract violent and property proportions
+tract_violent |>
+  select(pct_violent, pct_property, vacancy_rate, renter_rate) |>
+  pivot_longer(c(pct_violent, pct_property),
+               names_to = "outcome", values_to = "proportion") |>
+  pivot_longer(c(vacancy_rate, renter_rate),
+               names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    outcome  = case_when(
+      outcome == "pct_violent"  ~ "Violent",
+      outcome == "pct_property" ~ "Property"
+    )
+  ) |>
+  ggplot(aes(x = value, y = proportion, color = outcome)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Neighborhood Stability vs. Crime Type Proportion",
+    x     = "Predictor Value",
+    y     = "Proportion of Incidents",
+    color = "Crime Type"
+  ) +
+  theme_ibm()
+```
+
+### Social Disorganization
+
+```{r soc-scatter, fig.height=4}
+##social disorganization predictors vs tract violent and property proportions
+tract_violent |>
+  select(pct_violent, pct_property, single_parent_rate, lang_isolation_rate,
+         internet_rate, disability_rate) |>
+  pivot_longer(c(pct_violent, pct_property),
+               names_to = "outcome", values_to = "proportion") |>
+  pivot_longer(c(single_parent_rate, lang_isolation_rate,
+                 internet_rate, disability_rate),
+               names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    outcome  = case_when(
+      outcome == "pct_violent"  ~ "Violent",
+      outcome == "pct_property" ~ "Property"
+    )
+  ) |>
+  ggplot(aes(x = value, y = proportion, color = outcome)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Social Disorganization vs. Crime Type Proportion",
+    x     = "Predictor Value",
+    y     = "Proportion of Incidents",
+    color = "Crime Type"
+  ) +
+  theme_ibm()
+```
+
+### Demographics
+
+```{r demo-scatter, fig.height=6}
+##demographic predictors vs tract violent and property proportions
+tract_violent |>
+  select(pct_violent, pct_property, median_age,
+         pct_white, pct_black, pct_asian, pct_hispanic) |>
+  pivot_longer(c(pct_violent, pct_property),
+               names_to = "outcome", values_to = "proportion") |>
+  pivot_longer(c(median_age, pct_white,
+                 pct_black, pct_asian, pct_hispanic),
+               names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    outcome  = case_when(
+      outcome == "pct_violent"  ~ "Violent",
+      outcome == "pct_property" ~ "Property"
+    )
+  ) |>
+  ggplot(aes(x = value, y = proportion, color = outcome)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Demographics vs. Crime Type Proportion",
+    x     = "Predictor Value",
+    y     = "Proportion of Incidents",
+    color = "Crime Type"
+  ) +
+  theme_ibm()
+```
+
+### Educational Attainment
+
+```{r edu-scatter, fig.height=2}
+##education predictors vs tract violent and property proportions
+tract_violent |>
+  select(pct_violent, pct_property, edu_rate_no_hsdip, edu_rate_college) |>
+  pivot_longer(c(pct_violent, pct_property),
+               names_to = "outcome", values_to = "proportion") |>
+  pivot_longer(c(edu_rate_no_hsdip, edu_rate_college),
+               names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = acs_plot_labels[variable],
+    outcome  = case_when(
+      outcome == "pct_violent"  ~ "Violent",
+      outcome == "pct_property" ~ "Property"
+    )
+  ) |>
+  ggplot(aes(x = value, y = proportion, color = outcome)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Violent" = ibm_magenta, "Property" = ibm_purple)) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Educational Attainment vs. Crime Type Proportion",
+    x     = "Predictor Value",
+    y     = "Proportion of Incidents",
+    color = "Crime Type"
+  ) +
+  theme_ibm()
+```
+
+# RQ2: Are high-crime census tracts spatially clustered in the City of LA, and do neighboring tracts share similar socioeconomic characteristics?
+
+## Arrest Ratio
+
+### Descriptive Statistics
+
+```{r arrest-ratio-stats}
+tract_data |>
+  st_drop_geometry() |>
+  summarise(
+    Mean   = mean(arrest_ratio, na.rm = TRUE),
+    Median = median(arrest_ratio, na.rm = TRUE),
+    SD     = sd(arrest_ratio, na.rm = TRUE),
+    Min    = min(arrest_ratio, na.rm = TRUE),
+    Max    = max(arrest_ratio, na.rm = TRUE)
+  ) |>
+  knitr::kable(
+    digits   = 3,
+    booktabs = TRUE,
+    linesep  = "",
+    align    = c("r", "r", "r", "r", "r")
+  ) |>
+  kable_style() |>
+  kableExtra::add_header_above(
+    c("Descriptive Statistics: Arrest-to-Incident Ratio" = 5),
+    bold = TRUE, line = TRUE
+  )
+```
+
+### Distribution
+
+```{r arrest-ratio-dist}
+tract_data |>
+  st_drop_geometry() |>
+  ggplot(aes(x = arrest_ratio)) +
+  geom_histogram(bins = 40, fill = ibm_blue, color = "white") +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 0.4)) +
+  labs(
+    title    = "Distribution of Arrest-to-Incident Ratio Across Census Tracts",
+    subtitle = "Most tracts cluster below 15%, with a small number of high-arrest-rate outliers",
+    x        = "Arrest Ratio (Arrests / Total Incidents)",
+    y        = "Number of Tracts"
+  ) +
+  theme_ibm()
+```
+
+### Scatter
+
+```{r arrest-ratio-scatter, fig.height=8}
+##arrest ratio vs socioeconomic predictors — policing equity context
+tract_data |>
+  st_drop_geometry() |>
+  select(arrest_ratio, median_income, poverty_rate,
+         no_vehicle_rate, pct_black, pct_hispanic, pct_white) |>
+  pivot_longer(-arrest_ratio, names_to = "variable", values_to = "value") |>
+  mutate(variable = acs_plot_labels[variable]) |>
+  ggplot(aes(x = value, y = arrest_ratio)) +
+  geom_point(alpha = 0.3, size = 0.8, color = ibm_blue) +
+  geom_smooth(method = "loess", se = TRUE, color = ibm_magenta, linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Arrest-to-Incident Ratio vs. Socioeconomic Predictors",
+    x     = "Predictor Value",
+    y     = "Arrest Ratio (Arrests / Total Incidents)"
+  ) +
+  coord_cartesian(ylim = c(0, 0.4)) +
+  theme_ibm()
+```
+
+## Crime Rate Maps
+
+### Violent vs. Property Crime Across LA Census Tracts
+
+```{r violent-prop-map}
+##combined violent and property crime proportion maps
+tract_violent_joined <- tract_data |>
+  left_join(tract_violent |> select(GEOID, pct_violent, pct_property), by = "GEOID")
+
+violent_map  <- tm_choro(tract_violent_joined, "pct_violent",  "Violent Proportion",  "Proportion Violent")
+property_map <- tm_choro(tract_violent_joined, "pct_property", "Property Proportion", "Proportion Property")
+
+tmap_arrange(violent_map, property_map, ncol = 2)
+```
+
+### Violent vs. Property Crime Across LA Census Tracts
+
+```{r income-arrest-map}
+##arrest ratio and median income maps side by side
+arrest_map <- tm_choro(tract_data, "arrest_ratio", 
+                       "Arrest Ratio", 
+                       "Arrest-to-Incident Ratio Across LA Census Tracts")
+
+income_map <- tm_choro(tract_data, "median_income",
+                       "Median Income (USD)",
+                       "Median Household Income Across LA Census Tracts")
+
+tmap_arrange(arrest_map, income_map, ncol = 2)
+```
+

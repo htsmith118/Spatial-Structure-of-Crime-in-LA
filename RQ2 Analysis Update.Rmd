@@ -1,0 +1,1296 @@
+---
+title: "RQ2"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+date: "`r Sys.Date()`"
+---
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.height = 5, fig.width = 8)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(sf)
+library(here)
+library(tmap)
+library(spdep)
+library(broom)
+library(GWmodel)
+library(sp)
+
+tmap_mode("plot")
+
+set.seed(490)
+
+##IBM Carbon colorblind-safe palette
+ibm_blue    <- "#648FFF"
+ibm_purple  <- "#785EF0"
+ibm_magenta <- "#DC267F"
+ibm_orange  <- "#FE6100"
+ibm_gold    <- "#FFB000"
+
+crime_rate_labels <- c(
+  log1p_rate_violent  = "Violent Crime",
+  log1p_rate_property = "Property Crime"
+)
+
+acs_var_labels <- c(
+  median_income       = "Median Income",
+  gini                = "Gini Coefficient",
+  poverty_rate        = "Poverty Rate",
+  unemployment_rate   = "Unemployment Rate",
+  no_vehicle_rate     = "No Vehicle Rate",
+  housing_burden_rate = "Housing Burden Rate",
+  vacancy_rate        = "Vacancy Rate",
+  renter_rate         = "Renter Rate",
+  single_parent_rate  = "Single-Parent Rate",
+  lang_isolation_rate = "Language Isolation Rate",
+  internet_rate       = "Internet Access Rate",
+  disability_rate     = "Disability Rate",
+  median_age          = "Median Age",
+  pct_white           = "% White",
+  pct_black           = "% Black",
+  pct_asian           = "% Asian",
+  pct_hispanic        = "% Hispanic",
+  edu_rate_no_hsdip   = "No HS Diploma Rate",
+  edu_rate_college    = "College Degree Rate"
+)
+
+##full acs predictor set
+acs_model_vars <- c(
+  "median_income", "gini", "poverty_rate", "unemployment_rate",
+  "no_vehicle_rate", "housing_burden_rate", "vacancy_rate", "renter_rate",
+  "single_parent_rate", "lang_isolation_rate", "internet_rate", "disability_rate",
+  "median_age", "pct_white", "pct_black", "pct_asian", "pct_hispanic",
+  "edu_rate_no_hsdip", "edu_rate_college"
+)
+
+##post-vif retained predictors
+model_vars <- c(
+  "median_income", "gini", "poverty_rate", "unemployment_rate",
+  "no_vehicle_rate", "housing_burden_rate", "vacancy_rate", "renter_rate",
+  "single_parent_rate", "lang_isolation_rate", "internet_rate", "disability_rate",
+  "median_age", "edu_rate_no_hsdip"
+)
+
+##kable styling
+kable_style <- function(kbl) {
+  kbl |>
+    kableExtra::kable_styling(
+      latex_options = c("striped", "hold_position", "scale_down"),
+      stripe_color  = "#f5f5f5",
+      font_size     = 10
+    )
+}
+
+##ggplot theme
+theme_ibm <- function() {
+  theme_light() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.background = element_rect(fill = "#E8EEFF", color = NA),
+    strip.text       = element_text(face = "bold", size = 10, color = "#1a1a1a"),
+    axis.text        = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+}
+
+##choropleths
+la_bbox <- st_bbox(c(xmin = -118.95, ymin = 33.70,
+                     xmax = -118.10, ymax = 34.35),
+                   crs = st_crs(4326))
+
+tm_map_layout <- function(title) {
+  tm_layout(
+    main.title      = title,
+    main.title.size = 1,
+    legend.outside  = TRUE,
+    frame           = FALSE
+  )
+}
+
+tm_choro <- function(col, legend_title, map_title) {
+  tm_shape(tract_data, bbox = la_bbox) +
+    tm_polygons(
+      col        = col,
+      palette    = "-PuOr",
+      style      = "quantile",
+      n          = 5,
+      title      = legend_title,
+      border.col = NA
+    ) +
+    tm_map_layout(map_title)
+}
+
+##aicc
+ols_aicc <- function(model) {
+  n <- nobs(model)
+  k <- length(coef(model))
+  AIC(model) + (2 * k^2 + 2 * k) / (n - k - 1)
+}
+
+##symmetric fixed breaks centered on zero (residuals, coefficients)
+sym_breaks <- function(vals, n = 10) {
+  lim <- max(abs(vals), na.rm = TRUE)
+  seq(-lim, lim, length.out = n + 1)
+}
+
+##sequential fixed breaks from floor to max (local r2)
+seq_breaks <- function(vals, n = 10) {
+  lo <- min(0, min(vals, na.rm = TRUE))
+  hi <- max(vals, na.rm = TRUE)
+  seq(lo, hi, length.out = n + 1)
+}
+
+##lisa color palette 
+lisa_palette <- c(
+  "High-High"       = ibm_magenta,
+  "High-Low"        = ibm_orange,
+  "Low-High"        = ibm_blue,
+  "Low-Low"         = ibm_purple,
+  "Not Significant" = "#f0f0f0"
+)
+
+##lisa cluster map
+lisa_map <- function(data, title, legend_title = "LISA Cluster") {
+  data |>
+    tm_shape(bbox = la_bbox) +
+    tm_polygons(
+      col          = "quad",
+      palette      = lisa_palette,
+      title        = legend_title,
+      border.col   = NA,
+      border.alpha = 0,
+      colorNA      = "gray60",
+      textNA       = "Missing",
+      showNA       = TRUE
+    ) +
+    tm_map_layout(title)
+}
+
+#residuals map
+resid_map    <- function(data, outcome_label, title, breaks = NULL)
+  outcome_choro(data, "residual", "-PuOr", "Residual",  outcome_label, title, breaks = breaks)
+
+##r2 map
+local_r2_map <- function(data, outcome_label, title, breaks = NULL)
+  outcome_choro(data, "local_r2", "viridis", "Local R²", outcome_label, title, breaks = breaks)
+
+##placeholder panel
+blank_panel <- tm_shape(
+  st_sf(geometry = st_sfc(st_polygon(list(matrix(
+    c(-118.95, 33.70, -118.10, 33.70, -118.10, 34.35,
+      -118.95, 34.35, -118.95, 33.70),
+    ncol = 2, byrow = TRUE))), crs = st_crs(4326))),
+  bbox = la_bbox) +
+  tm_fill(col = "white") +
+  tm_layout(
+    frame          = FALSE,
+    frame.lwd      = 0,
+    legend.show    = FALSE,
+    bg.color       = "white",
+    outer.bg.color = "white",
+    outer.margins  = 0,
+    inner.margins  = 0,
+    asp            = 0
+  )
+
+##extract local coefficients
+extract_coef_data <- function(sdf_data, outcome_label) {
+  map_dfr(model_vars, function(var) {
+    coef_val <- sdf_data[[var]]
+    t_val    <- sdf_data[[paste0(var, "_TV")]]
+    tract_data |>
+      st_drop_geometry() |>
+      select(GEOID) |>
+      mutate(
+        outcome   = outcome_label,
+        predictor = acs_var_labels[var],
+        coef      = if_else(abs(t_val) >= 1.96, coef_val, NA_real_)
+      )
+  })
+}
+
+##coefficient choropleth
+coef_map <- function(map_data, var_label, outcome_label, title, breaks = NULL) {
+  tract_data |>
+    left_join(
+      map_data |> filter(predictor == var_label, outcome == outcome_label),
+      by = "GEOID"
+    ) |>
+    tm_shape(bbox = la_bbox) +
+    tm_polygons(
+      col          = "coef",
+      palette      = "-PuOr",
+      style        = if (is.null(breaks)) "quantile" else "fixed",
+      breaks       = breaks,
+      n            = if (is.null(breaks)) 5 else NULL,
+      midpoint     = 0,
+      title        = "Coefficient",
+      border.col   = NA,
+      border.alpha = 0,
+      colorNA      = "gray80",
+      textNA       = "Not Significant / Missing"
+    ) +
+    tm_map_layout(title)
+}
+
+##outcome choropleth 
+outcome_choro <- function(data, col, palette, legend_title, outcome_label, title,
+                          colorNA = "gray60", textNA = "Missing", breaks = NULL) {
+  tract_data |>
+    left_join(data |> filter(outcome == outcome_label), by = "GEOID") |>
+    tm_shape(bbox = la_bbox) +
+    tm_polygons(
+      col          = col,
+      palette      = palette,
+      style        = if (is.null(breaks)) "quantile" else "fixed",
+      breaks       = breaks,
+      n            = if (is.null(breaks)) 5 else NULL,
+      title        = legend_title,
+      border.col   = NA,
+      border.alpha = 0,
+      colorNA      = colorNA,
+      textNA       = textNA
+    ) +
+    tm_map_layout(title)
+}
+
+##mgwr coefficient summary
+mgwr_coef_summary <- function(mgwr_model, outcome_label) {
+  sdf <- mgwr_model$SDF@data
+  map_dfr(model_vars, function(var) {
+    coef_val <- sdf[[var]]
+    t_val    <- sdf[[paste0(var, "_TV")]]
+    sig      <- abs(t_val) >= 1.96
+    tibble(
+      Outcome         = outcome_label,
+      Predictor       = acs_var_labels[var],
+      Min             = round(min(coef_val,    na.rm = TRUE), 3),
+      Mean            = round(mean(coef_val,   na.rm = TRUE), 3),
+      Median          = round(median(coef_val, na.rm = TRUE), 3),
+      Max             = round(max(coef_val,    na.rm = TRUE), 3),
+      `% Significant` = paste0(round(mean(sig, na.rm = TRUE) * 100, 1), "%"),
+      pct_sig_num     = mean(sig, na.rm = TRUE)
+    )
+  })
+}
+
+##local r2 for mgwr
+mgwr_local_r2 <- function(mgwr_model, outcome_var, bw_k, dist_mat) {
+  y     <- tract_data[[outcome_var]]
+  resid <- mgwr_model$SDF$residual
+  n     <- nrow(dist_mat)
+  W     <- matrix(0, n, n)
+  for (i in seq_len(n)) {
+    d      <- dist_mat[i, ]
+    h_i    <- sort(d)[bw_k + 1]
+    w      <- ifelse(d < h_i, (1 - (d / h_i)^2)^2, 0)
+    W[i, ] <- w
+  }
+  map_dbl(seq_len(n), function(i) {
+    w       <- W[i, ]
+    y_wmean <- sum(w * y) / sum(w)
+    tss     <- sum(w * (y - y_wmean)^2)
+    rss     <- sum(w * resid^2)
+    if (tss < 1e-6) return(NA_real_)
+    1 - rss / tss
+  })
+}
+```
+
+```{r load-data}
+tract_data <- readRDS(here("output", "tract_data.rds"))
+tract_data <- tract_data |>
+  mutate(
+    arrest_ratio        = n_arrested / total_incidents,
+    ##log1p transformation applied to right-skewed crime rates
+    log1p_rate_violent  = log1p(rate_violent),
+    log1p_rate_property = log1p(rate_property)
+    )
+```
+
+# Spatial Autocorrelation
+
+## Spatial Weights
+
+A weights matrix was constructed across all tracts using queen contiguity (any touching counts as a neighbor). One tract (GEOID 06037602201) has no contiguous neighbors, and is retained in modelling using `zero.policy = TRUE` and excluded from Bivariate LISA, which does not support that option.
+
+```{r spatial-weights}
+nb_queen <- poly2nb(tract_data, queen = TRUE)
+
+##row-standardize weights so each tract's neighbors sum to 1
+w_queen  <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+
+tibble(
+  Metric = c("Number of Tracts", "Average Neighbors", "Isolated Tracts"),
+  Value  = c("1,221", "6.15", "1")
+) |>
+  knitr::kable(
+    caption = "Queen Contiguity Spatial Weights Matrix Summary",
+    align   = c("l", "r")
+  ) |>
+  kable_style()
+
+isolated_geoid <- tract_data$GEOID[card(nb_queen) == 0]
+```
+
+## Calculate Global Moran's I
+
+```{r global-morans-i}
+moran_results <- map_dfr(names(crime_rate_labels), function(var) {
+  result <- moran.mc(tract_data[[var]], listw = w_queen,
+                     nsim = 999, zero.policy = TRUE)
+  tibble(
+    Outcome     = crime_rate_labels[var],
+    `Moran's I` = round(result$statistic, 4),
+    `p-value`   = round(result$p.value,   4)
+  )
+})
+
+moran_results |>
+  knitr::kable(
+    caption = "Global Moran's I: Crime Rate Spatial Autocorrelation",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+## Visualize Global Moran's I
+
+```{r global-morans-plot, fig.height=4, fig.width=7}
+##standardize each rate then compute spatial lag from standardized values
+moran_plot_data <- map_dfr(names(crime_rate_labels), function(var) {
+  x     <- scale(tract_data[[var]])[, 1]
+  lag_x <- lag.listw(w_queen, x, zero.policy = TRUE)
+  tibble(
+    x       = x,
+    lag_x   = lag_x,
+    outcome = crime_rate_labels[var]
+  )
+})
+
+moran_plot_data |>
+  ggplot(aes(x = x, y = lag_x)) +
+  geom_hline(yintercept = 0, color = "gray40", linewidth = 0.5, linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "gray40", linewidth = 0.5, linetype = "dashed") +
+  geom_point(alpha = 0.25, size = 0.8, color = ibm_blue) +
+  geom_smooth(method = "lm", se = FALSE, color = ibm_magenta, linewidth = 0.8) +
+  facet_wrap(~ outcome) +
+  labs(
+    title = "Moran Scatterplots: Spatial Autocorrelation of Crime Rates",
+    x = "Standardized Crime Rate",
+    y = "Spatially Lagged Crime Rate"
+  ) +
+  coord_cartesian(xlim = c(-2, 6), ylim = c(-2, 6)) +
+  theme_ibm()
+```
+
+## Global Moran's I: Socioeconomic Predictors
+
+```{r predictor-morans-i}
+map_dfr(acs_model_vars, function(var) {
+  result <- moran.mc(tract_data[[var]], listw = w_queen,
+                     nsim = 999, zero.policy = TRUE)
+  tibble(
+    Predictor   = acs_var_labels[var],
+    `Moran's I` = round(result$statistic, 4),
+    `p-value`   = round(result$p.value,   4)
+  )
+}) |>
+  arrange(desc(`Moran's I`)) |>
+  knitr::kable(
+    caption = "Global Moran's I: ACS Predictors",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+\newpage
+
+# Variable Inflation Factor (VIF)
+
+All 19 candidate ACS predictors were screened for multicollinearity. Predictors with VIF > 10 were removed.
+
+```{r vif}
+fit <- lm(
+  as.formula(paste("log1p_rate_violent ~", paste(acs_model_vars, collapse = " + "))),
+  data = st_drop_geometry(tract_data) |>
+    mutate(across(all_of(acs_model_vars), ~ as.numeric(scale(.x))))
+)
+
+vif_results <- tibble(
+  Predictor = names(car::vif(fit)),
+  VIF       = round(car::vif(fit), 3)
+)
+
+vif_results |>
+  mutate(
+    Predictor = acs_var_labels[Predictor],
+    Decision  = if_else(VIF > 10, "Removed", "Retained")
+  ) |>
+  arrange(desc(VIF)) |>
+  knitr::kable(
+    caption   = "VIF Screening: Full Predictor Set",
+    digits    = 3,
+    col.names = c("Predictor", "VIF", "Decision"),
+    align     = c("l", "r", "l")
+  ) |>
+  kable_style()
+```
+
+# Local Indicators of Spatial Association (LISA)
+
+Global Moran's I confirmed that both crime rates and socioeconomic predictors cluster spatially, but does not identify where. LISA decomposes the global statistic to each tract. At 1,221 tests, the p < 0.05 threshold would produce approximately 61 expected false positives, compared to roughly 12 at p < 0.01.
+
+```{r lisa}
+lisa_results <- map(names(crime_rate_labels), function(var) {
+  localmoran_perm(tract_data[[var]], listw = w_queen,
+                  nsim = 999, zero.policy = TRUE)
+}) |>
+  set_names(names(crime_rate_labels))
+
+lisa_classified <- map_dfr(names(crime_rate_labels), function(var) {
+  x     <- scale(tract_data[[var]])[, 1]
+  lag_x <- lag.listw(w_queen, x, zero.policy = TRUE)
+  p_val <- lisa_results[[var]][, "Pr(z != E(Ii))"]
+
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      outcome = crime_rate_labels[var],
+      x       = x,
+      lag_x   = lag_x,
+      p_val   = p_val,
+      quad    = case_when(
+        p_val >= 0.01        ~ "Not Significant",
+        x > 0 & lag_x > 0   ~ "High-High",
+        x > 0 & lag_x <= 0  ~ "High-Low",
+        x <= 0 & lag_x > 0  ~ "Low-High",
+        x <= 0 & lag_x <= 0 ~ "Low-Low"
+      )
+    )
+})
+```
+
+## Crime Outcomes
+
+```{r lisa-table}
+lisa_classified |>
+  count(outcome, quad) |>
+  pivot_wider(names_from = outcome, values_from = n, values_fill = 0) |>
+  rename(Classification = quad) |>
+  arrange(match(Classification,
+                c("High-High", "High-Low", "Low-High", "Low-Low", "Not Significant"))) |>
+  knitr::kable(
+    caption = "LISA Classifications by Crime Rate Outcome",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+\newpage
+
+## Predictor LISA
+
+```{r predictor-lisa-compute}
+predictor_lisa_results <- map(model_vars, function(var) {
+  localmoran_perm(tract_data[[var]], listw = w_queen,
+                  nsim = 999, zero.policy = TRUE)
+}) |>
+  set_names(model_vars)
+
+predictor_lisa_classified <- map_dfr(model_vars, function(var) {
+  x     <- scale(tract_data[[var]])[, 1]
+  lag_x <- lag.listw(w_queen, x, zero.policy = TRUE)
+  p_val <- predictor_lisa_results[[var]][, "Pr(z != E(Ii))"]
+
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      predictor = acs_var_labels[var],
+      x         = x,
+      lag_x     = lag_x,
+      p_val     = p_val,
+      quad      = case_when(
+        p_val >= 0.01        ~ "Not Significant",
+        x > 0 & lag_x > 0   ~ "High-High",
+        x > 0 & lag_x <= 0  ~ "High-Low",
+        x <= 0 & lag_x > 0  ~ "Low-High",
+        x <= 0 & lag_x <= 0 ~ "Low-Low"
+      )
+    )
+})
+
+predictor_lisa_classified |>
+  count(predictor, quad) |>
+  pivot_wider(names_from = quad, values_from = n, values_fill = 0) |>
+  rename(Predictor = predictor) |>
+  select(Predictor, `High-High`, `High-Low`, `Low-High`, `Low-Low`, `Not Significant`) |>
+  arrange(desc(`High-High`)) |>
+  knitr::kable(
+    caption = "LISA Classifications: ACS Predictors",
+    align   = c("l", "r", "r", "r", "r", "r")
+  ) |>
+  kable_style()
+```
+
+## LISA Maps
+
+### Crime vs Property
+
+```{r lisa-map}
+lisa_map_data <- tract_data |>
+  left_join(lisa_classified, by = "GEOID") |>
+  mutate(
+    quad = factor(quad, levels = c("High-High", "High-Low",
+                                   "Low-High", "Low-Low",
+                                   "Not Significant"))
+  )
+
+tmap_arrange(
+  lisa_map_data |> filter(outcome == "Violent Crime")  |> lisa_map("Violent Crime LISA Clusters"),
+  lisa_map_data |> filter(outcome == "Property Crime") |> lisa_map("Property Crime LISA Clusters"),
+  ncol = 2, outer.margins = 0
+)
+```
+
+### Predictors
+
+```{r predictor-lisa-maps, fig.height=4, fig.show='asis'}
+predictor_lisa_map_data <- tract_data |>
+  left_join(predictor_lisa_classified, by = "GEOID") |>
+  mutate(
+    quad = factor(quad, levels = c("High-High", "High-Low",
+                                   "Low-High",  "Low-Low",
+                                   "Not Significant"))
+  )
+
+preds       <- unique(predictor_lisa_classified$predictor)
+pred_groups <- split(preds, ceiling(seq_along(preds) / 2))
+
+for (grp in pred_groups) {
+ maps   <- lapply(grp, function(pred) {
+    predictor_lisa_map_data |>
+      filter(predictor == pred) |>
+      lisa_map(paste(pred, "LISA Clusters"))
+  })
+  second <- if (length(maps) == 2) maps[[2]] else blank_panel
+  print(tmap_arrange(maps[[1]], second, ncol = 2, outer.margins = 0))
+}
+```
+
+\newpage
+
+# Ordinary Least Squares (OLS)
+
+OLS provides a global baseline that assumes each predictor's relationship with crime is constant across all tracts. All predictors are standardized to mean 0, SD 1 so that coefficients reflect the change in log1p crime rate per one standard deviation increase in the predictor.
+
+```{r ols}
+ols_formula <- function(outcome) {
+  as.formula(paste(outcome, "~", paste(model_vars, collapse = " + ")))
+}
+
+ols_models <- map(names(crime_rate_labels), function(var) {
+  lm(ols_formula(var), data = st_drop_geometry(tract_data) |>
+       mutate(across(all_of(model_vars), ~ as.numeric(scale(.x)))))
+}) |>
+  set_names(names(crime_rate_labels))
+```
+
+```{r ols-summary-violent}
+tidy(ols_models[["log1p_rate_violent"]]) |>
+  mutate(
+    term = recode(term,
+      "(Intercept)"        = "Intercept",
+      !!!setNames(acs_var_labels, acs_model_vars)
+    ),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  ) |>
+  select(term, estimate, std.error, statistic, p.value, sig) |>
+  knitr::kable(
+    caption   = "OLS Coefficients: Violent Crime",
+    digits    = 3,
+    col.names = c("Predictor", "Estimate", "Std. Error", "t", "p-value", ""),
+    align     = c("l", "r", "r", "r", "r", "l")
+  ) |>
+  kable_style()
+```
+
+```{r ols-summary-property}
+tidy(ols_models[["log1p_rate_property"]]) |>
+  mutate(
+    term = recode(term,
+      "(Intercept)"        = "Intercept",
+      !!!setNames(acs_var_labels, acs_model_vars)
+    ),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  ) |>
+  select(term, estimate, std.error, statistic, p.value, sig) |>
+  knitr::kable(
+    caption   = "OLS Coefficients: Property Crime",
+    digits    = 3,
+    col.names = c("Predictor", "Estimate", "Std. Error", "t", "p-value", ""),
+    align     = c("l", "r", "r", "r", "r", "l")
+  ) |>
+  kable_style()
+```
+
+\newpage 
+
+## Model Fit Assessment
+
+```{r ols-fit}
+map_dfr(names(crime_rate_labels), function(var) {
+  fit <- ols_models[[var]]
+  glance(fit) |>
+    mutate(
+      Outcome = crime_rate_labels[var],
+      AICc    = round(ols_aicc(fit), 3)
+    ) |>
+    select(Outcome, r.squared, adj.r.squared, AICc, BIC, df.residual)
+}) |>
+  knitr::kable(
+    caption = "OLS Model Fit Statistics",
+    digits  = 3,
+    align   = c("l", "r", "r", "r", "r", "r")
+  ) |>
+  kable_style()
+```
+
+```{r ols-residuals-morans}
+map_dfr(names(crime_rate_labels), function(var) {
+  resid  <- residuals(ols_models[[var]])
+  result <- moran.mc(resid, listw = w_queen, nsim = 999, zero.policy = TRUE)
+  tibble(
+    Outcome     = crime_rate_labels[var],
+    `Moran's I` = round(result$statistic, 4),
+    `p-value`   = round(result$p.value,   4)
+  )
+}) |>
+  knitr::kable(
+    caption = "Moran's I on OLS Residuals",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+```{r ols-residuals-extract}
+ols_resid_data <- map_dfr(names(crime_rate_labels), function(var) {
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      outcome  = crime_rate_labels[var],
+      residual = residuals(ols_models[[var]])
+    )
+})
+```
+
+\newpage
+
+# Geographically Weighted Regression (GWR)
+
+GWR fits a separate weighted regression at each tract where nearby tracts contribute more to local estimates than distant ones.
+
+## Bandwidth Selection
+
+```{r bandwidth-selection, cache=TRUE}
+centroids <- st_coordinates(st_centroid(tract_data))
+tract_sp <- tract_data |>
+  mutate(
+    across(all_of(model_vars), ~ as.numeric(scale(.x))),
+    X = centroids[, 1],
+    Y = centroids[, 2]
+  ) |>
+  st_drop_geometry() |>
+  as.data.frame()
+
+coordinates(tract_sp) <- ~ X + Y
+
+invisible(capture.output({
+  bw_violent <- bw.gwr(
+    formula  = as.formula(paste("log1p_rate_violent ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    approach = "AICc",
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+
+  bw_property <- bw.gwr(
+    formula  = as.formula(paste("log1p_rate_property ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    approach = "AICc",
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+}))
+
+tibble(
+  Outcome   = c("Violent Crime", "Property Crime"),
+  Bandwidth = c(bw_violent, bw_property),
+  Type      = "Adaptive (Nearest Neighbors)",
+  Kernel    = "Bisquare",
+  Method    = "AICc"
+) |>
+  knitr::kable(
+    caption = "GWR Bandwidth Selection Results",
+    align   = c("l", "r", "l", "l", "l")
+  ) |>
+  kable_style()
+```
+
+## Local Variance Inflation Factor (LVIF)
+
+```{r lvif, cache=TRUE}
+invisible(capture.output({
+  lvif_violent <- gwr.collin.diagno(
+    formula  = as.formula(paste("log1p_rate_violent ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    bw       = bw_violent,
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+
+  lvif_property <- gwr.collin.diagno(
+    formula  = as.formula(paste("log1p_rate_property ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    bw       = bw_property,
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+}))
+```
+
+```{r lvif-summary}
+summarise_lvif <- function(data) {
+  data |>
+    select(ends_with("_VIF")) |>
+    summarise(across(everything(), list(
+      Mean = \(x) round(mean(x, na.rm = TRUE), 3),
+      Max  = \(x) round(max(x,  na.rm = TRUE), 3)
+    ))) |>
+    pivot_longer(
+      everything(),
+      names_to      = c("Predictor", ".value"),
+      names_pattern = "(.+)_VIF_(Mean|Max)"
+    ) |>
+    mutate(Predictor = acs_var_labels[Predictor])
+}
+
+summarise_lvif(lvif_violent$SDF@data) |>
+  rename(Violent_Mean = Mean, Violent_Max = Max) |>
+  left_join(
+    summarise_lvif(lvif_property$SDF@data) |>
+      rename(Property_Mean = Mean, Property_Max = Max),
+    by = "Predictor"
+  ) |>
+  arrange(desc(Violent_Max)) |>
+  knitr::kable(
+    caption   = "LVIF Summary: Violent and Property Crime",
+    align     = c("l", "r", "r", "r", "r"),
+    col.names = c("Predictor", "Mean", "Max", "Mean", "Max")
+  ) |>
+  kable_style() |>
+  add_header_above(c(" " = 1, "Violent" = 2, "Property" = 2))
+```
+
+\newpage
+
+## Model Fit Comparison
+
+```{r gwr, cache=TRUE}
+invisible(capture.output({
+  gwr_violent <- gwr.basic(
+    formula  = as.formula(paste("log1p_rate_violent ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    bw       = bw_violent,
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+
+  gwr_property <- gwr.basic(
+    formula  = as.formula(paste("log1p_rate_property ~", paste(model_vars, collapse = " + "))),
+    data     = tract_sp,
+    bw       = bw_property,
+    kernel   = "bisquare",
+    adaptive = TRUE
+  )
+}))
+```
+
+```{r gwr-fit}
+tibble(
+  Outcome          = c("Violent Crime", "Property Crime"),
+  `OLS R²`         = c(round(summary(ols_models[["log1p_rate_violent"]])$r.squared,  3),
+                       round(summary(ols_models[["log1p_rate_property"]])$r.squared, 3)),
+  `GWR R²`         = c(round(gwr_violent$GW.diagnostic$gw.R2,  3),
+                       round(gwr_property$GW.diagnostic$gw.R2, 3)),
+  `R² Improvement` = c(round(gwr_violent$GW.diagnostic$gw.R2  
+                       - summary(ols_models[["log1p_rate_violent"]])$r.squared,  3),
+                       round(gwr_property$GW.diagnostic$gw.R2 
+                       - summary(ols_models[["log1p_rate_property"]])$r.squared, 3)),
+  `OLS AICc`       = c(round(ols_aicc(ols_models[["log1p_rate_violent"]]),  1),
+                        round(ols_aicc(ols_models[["log1p_rate_property"]]), 1)),
+  `GWR AICc`       = c(round(gwr_violent$GW.diagnostic$AICc,  1),
+                        round(gwr_property$GW.diagnostic$AICc, 1))
+  ) |>
+  knitr::kable(
+    caption = "OLS vs GWR Model Fit Comparison",
+    align   = c("l", "r", "r", "r", "r", "r")
+  ) |>
+  kable_style()
+```
+
+```{r gwr-residuals-morans}
+map_dfr(list(
+  list(model = gwr_violent,  label = "Violent Crime"),
+  list(model = gwr_property, label = "Property Crime")
+), function(x) {
+  resid  <- x$model$SDF$residual
+  result <- moran.mc(resid, listw = w_queen, nsim = 999, zero.policy = TRUE)
+  tibble(
+    Outcome     = x$label,
+    `Moran's I` = round(result$statistic, 4),
+    `p-value`   = round(result$p.value,   4)
+  )
+}) |>
+  knitr::kable(
+    caption = "Moran's I on GWR Residuals",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+```{r gwr-residuals-extract}
+gwr_resid_data <- map_dfr(list(
+  list(model = gwr_violent,  label = "Violent Crime"),
+  list(model = gwr_property, label = "Property Crime")
+), function(x) {
+  tibble(
+    GEOID    = tract_data$GEOID,
+    outcome  = x$label,
+    residual = x$model$SDF$residual
+  )
+})
+```
+
+```{r gwr-r2-extract}
+gwr_r2_data <- map_dfr(list(
+  list(model = gwr_violent,  label = "Violent Crime"),
+  list(model = gwr_property, label = "Property Crime")
+), function(x) {
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      outcome  = x$label,
+      local_r2 = x$model$SDF$Local_R2
+    )
+})
+```
+
+\newpage
+
+# Multiscale Geographically Weighted Regression (MGWR)
+
+MGWR extends GWR by allowing each predictor to operate at its own spatial scale, estimating a separate bandwidth per variable.
+
+## Bandwidth Selection
+
+```{r mgwr, cache=TRUE}
+invisible(capture.output({
+  mgwr_violent <- gwr.multiscale(
+    formula   = as.formula(paste("log1p_rate_violent ~", paste(model_vars, collapse = " + "))),
+    data      = tract_sp,
+    adaptive  = TRUE,
+    kernel    = "bisquare",
+    criterion = "CVR",
+    bws0      = rep(bw_violent, length(model_vars) + 1),
+    verbose   = FALSE
+  )
+
+  mgwr_property <- gwr.multiscale(
+    formula   = as.formula(paste("log1p_rate_property ~", paste(model_vars, collapse = " + "))),
+    data      = tract_sp,
+    adaptive  = TRUE,
+    kernel    = "bisquare",
+    criterion = "CVR",
+    bws0      = rep(bw_property, length(model_vars) + 1),
+    verbose   = FALSE
+  )
+}))
+```
+
+```{r mgwr-bandwidths}
+tibble(
+  Predictor        = acs_var_labels[model_vars],
+  `Violent Crime`  = mgwr_violent$GW.arguments$bws[-1],
+  `Property Crime` = mgwr_property$GW.arguments$bws[-1]
+) |>
+  arrange(`Violent Crime`) |>
+  knitr::kable(
+    caption = "MGWR Per-Predictor Bandwidths",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+## Model Fit Comparison
+
+```{r mgwr-fit}
+tibble(
+  Outcome        = c("Violent Crime", "Property Crime"),
+  `OLS R²`  = c(round(summary(ols_models[["log1p_rate_violent"]])$r.squared,  3),
+                      round(summary(ols_models[["log1p_rate_property"]])$r.squared, 3)),
+  `GWR R²`  = c(round(gwr_violent$GW.diagnostic$gw.R2,  3),
+                      round(gwr_property$GW.diagnostic$gw.R2, 3)),
+  `MGWR R²` = c(round(mgwr_violent$GW.diagnostic$R2.val,  3),
+                      round(mgwr_property$GW.diagnostic$R2.val, 3)),
+  `OLS AICc`     = c(round(ols_aicc(ols_models[["log1p_rate_violent"]]),  1),
+                      round(ols_aicc(ols_models[["log1p_rate_property"]]), 1)),
+  `GWR AICc`     = c(round(gwr_violent$GW.diagnostic$AICc,  1),
+                      round(gwr_property$GW.diagnostic$AICc, 1)),
+  `MGWR AICc`    = c(round(mgwr_violent$GW.diagnostic$AICc,  1),
+                      round(mgwr_property$GW.diagnostic$AICc, 1))
+) |>
+  knitr::kable(
+    caption = "OLS vs GWR vs MGWR Model Fit Comparison",
+    align   = c("l", "r", "r", "r", "r", "r", "r")
+  ) |>
+  kable_style()
+```
+
+```{r mgwr-residuals-morans}
+map_dfr(list(
+  list(model = mgwr_violent,  label = "Violent Crime"),
+  list(model = mgwr_property, label = "Property Crime")
+), function(x) {
+  resid  <- x$model$SDF$residual
+  result <- moran.mc(resid, listw = w_queen, nsim = 999, zero.policy = TRUE)
+  tibble(
+    Outcome     = x$label,
+    `Moran's I` = round(result$statistic, 4),
+    `p-value`   = round(result$p.value,   4)
+  )
+}) |>
+  knitr::kable(
+    caption = "Moran's I on MGWR Residuals",
+    align   = c("l", "r", "r")
+  ) |>
+  kable_style()
+```
+
+## Residuals Maps
+
+```{r mgwr-residuals-extract}
+mgwr_resid_data <- map_dfr(list(
+  list(model = mgwr_violent,  label = "Violent Crime"),
+  list(model = mgwr_property, label = "Property Crime")
+), function(x) {
+  tibble(
+    GEOID    = tract_data$GEOID,
+    outcome  = x$label,
+    residual = x$model$SDF$residual
+  )
+})
+```
+
+\newpage
+
+## Coefficient Overview
+
+```{r mgwr-coef-summary}
+mgwr_summary_data <- bind_rows(
+  mgwr_coef_summary(mgwr_violent,  "Violent Crime"),
+  mgwr_coef_summary(mgwr_property, "Property Crime")
+)
+
+##identify predictors with at least one significant tract per outcome
+mgwr_sig_violent  <- mgwr_summary_data |>
+  filter(Outcome == "Violent Crime",  pct_sig_num > 0) |>
+  pull(Predictor)
+
+mgwr_sig_property <- mgwr_summary_data |>
+  filter(Outcome == "Property Crime", pct_sig_num > 0) |>
+  pull(Predictor)
+
+mgwr_summary_data |>
+  select(-Outcome, -pct_sig_num) |>
+  knitr::kable(
+    caption = "MGWR Coefficient Summary by Outcome",
+    align   = c("l", "r", "r", "r", "r", "r")
+  ) |>
+  kable_style() |>
+  kableExtra::pack_rows("Violent Crime",  1, length(model_vars)) |>
+  kableExtra::pack_rows("Property Crime", length(model_vars) + 1, length(model_vars) * 2)
+```
+
+```{r mgwr-coef-setup}
+##extract significant mgwr coefficients
+mgwr_violent_map_data  <- extract_coef_data(mgwr_violent$SDF@data,  "Violent Crime")
+mgwr_property_map_data <- extract_coef_data(mgwr_property$SDF@data, "Property Crime")
+
+##pool all significant coefficients across all predictors and both outcomes for a unified scale
+all_sig_coefs   <- c(mgwr_violent_map_data$coef, mgwr_property_map_data$coef)
+coef_brks_global <- sym_breaks(all_sig_coefs[!is.na(all_sig_coefs)])
+```
+
+\newpage
+
+## Coefficient Maps
+
+```{r mgwr-coef-maps-paired, fig.show='asis'}
+mgwr_sig_either <- union(mgwr_sig_violent, mgwr_sig_property)
+
+for (var in model_vars) {
+  label <- acs_var_labels[var]
+  if (!label %in% mgwr_sig_either) next
+
+  v_map <- if (label %in% mgwr_sig_violent)
+    coef_map(mgwr_violent_map_data,  label, "Violent Crime",
+             paste("Violent Crime:", label),  coef_brks_global) else blank_panel
+  p_map <- if (label %in% mgwr_sig_property)
+    coef_map(mgwr_property_map_data, label, "Property Crime",
+             paste("Property Crime:", label), coef_brks_global) else blank_panel
+
+  print(tmap_arrange(v_map, p_map, ncol = 2, outer.margins = 0))
+}
+```
+
+## Local R² Extraction
+
+```{r mgwr-r2-extract}
+if (isTRUE(st_is_longlat(tract_data))) {
+  tract_proj <- st_transform(tract_data, 3310)
+} else {
+  tract_proj <- tract_data
+}
+
+coords   <- st_coordinates(st_centroid(tract_proj))
+dist_mat <- as.matrix(dist(coords))
+
+##minimum bandwidth per model
+bw_k_violent  <- min(mgwr_violent$GW.arguments$bws[-1])
+bw_k_property <- min(mgwr_property$GW.arguments$bws[-1])
+
+mgwr_r2_data <- bind_rows(
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      outcome  = "Violent Crime",
+      local_r2 = mgwr_local_r2(mgwr_violent, "log1p_rate_violent",
+                                bw_k_violent, dist_mat)
+    ),
+  tract_data |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      outcome  = "Property Crime",
+      local_r2 = mgwr_local_r2(mgwr_property, "log1p_rate_property",
+                                bw_k_property, dist_mat)
+    )
+)
+```
+
+\newpage
+
+## Residuals Maps
+
+```{r global-scales}
+##pool all residuals across OLS, GWR, and MGWR to define one shared symmetric scale
+resid_brks_global <- sym_breaks(
+  c(ols_resid_data$residual, gwr_resid_data$residual, mgwr_resid_data$residual)
+)
+
+##pool all local r2 values across GWR and MGWR to define one shared sequential scale
+r2_brks_global <- seq_breaks(c(gwr_r2_data$local_r2, mgwr_r2_data$local_r2))
+```
+
+```{r resid-maps-ols}
+tmap_arrange(
+  resid_map(ols_resid_data, "Violent Crime",  "Violent Crime: OLS Residuals",  resid_brks_global),
+  resid_map(ols_resid_data, "Property Crime", "Property Crime: OLS Residuals", resid_brks_global),
+  ncol = 2, outer.margins = 0
+)
+```
+
+```{r resid-maps-gwr}
+tmap_arrange(
+  resid_map(gwr_resid_data, "Violent Crime",  "Violent Crime: GWR Residuals",  resid_brks_global),
+  resid_map(gwr_resid_data, "Property Crime", "Property Crime: GWR Residuals", resid_brks_global),
+  ncol = 2, outer.margins = 0
+)
+```
+
+```{r resid-maps-mgwr}
+tmap_arrange(
+  resid_map(mgwr_resid_data, "Violent Crime",  "Violent Crime: MGWR Residuals",  resid_brks_global),
+  resid_map(mgwr_resid_data, "Property Crime", "Property Crime: MGWR Residuals", resid_brks_global),
+  ncol = 2, outer.margins = 0
+)
+```
+
+\newpage
+
+## Local R² Maps
+
+```{r r2-maps-gwr}
+tmap_arrange(
+  local_r2_map(gwr_r2_data, "Violent Crime",  "Violent Crime: GWR Local R²",  r2_brks_global),
+  local_r2_map(gwr_r2_data, "Property Crime", "Property Crime: GWR Local R²", r2_brks_global),
+  ncol = 2, outer.margins = 0
+)
+```
+
+```{r r2-maps-mgwr}
+tmap_arrange(
+  local_r2_map(mgwr_r2_data, "Violent Crime",  "Violent Crime: MGWR Local R²",  r2_brks_global),
+  local_r2_map(mgwr_r2_data, "Property Crime", "Property Crime: MGWR Local R²", r2_brks_global),
+  ncol = 2, outer.margins = 0
+)
+```
+
+\newpage
+
+# Bivariate LISA
+
+Bivariate LISA examines the spatial co-clustering of each significant MGWR predictor with crime rates, testing whether tracts high in a given socioeconomic indicator are surrounded by tracts with high crime (and vice versa).
+
+```{r bv-lisa-compute}
+tract_bv <- tract_data |>
+  filter(GEOID != isolated_geoid)
+
+nb_bv <- poly2nb(tract_bv, queen = TRUE)
+w_bv  <- nb2listw(nb_bv, style = "W", zero.policy = FALSE)
+
+bv_pair_df <- bind_rows(
+  tibble(label_x = mgwr_sig_violent,  y = "log1p_rate_violent",  label_y = "Violent Crime"),
+  tibble(label_x = mgwr_sig_property, y = "log1p_rate_property", label_y = "Property Crime")
+) |>
+  mutate(x = names(acs_var_labels)[match(label_x, acs_var_labels)]) |>
+  arrange(
+    match(x, model_vars),
+    match(label_y, c("Violent Crime", "Property Crime"))
+  )
+
+bv_pairs <- pmap(bv_pair_df, function(x, y, label_x, label_y) {
+  list(x = x, y = y, label_x = label_x, label_y = label_y)
+})
+
+bv_lisa_results <- map(bv_pairs, function(p) {
+  x_std <- scale(tract_bv[[p$x]])[, 1]
+  y_std <- scale(tract_bv[[p$y]])[, 1]
+
+  lm_bv <- localmoran_bv(x_std, y_std, listw = w_bv, nsim = 999)
+
+  lag_y <- lag.listw(w_bv, y_std)
+  p_val <- lm_bv[, "Pr(z != E(Ibvi))"]
+
+  tract_bv |>
+    st_drop_geometry() |>
+    select(GEOID) |>
+    mutate(
+      label   = paste(p$label_x, "x", p$label_y),
+      label_x = p$label_x,
+      label_y = p$label_y,
+      bv_i    = lm_bv[, "Ibvi"],
+      p_val   = p_val,
+      x_std   = x_std,
+      lag_y   = lag_y,
+      quad    = case_when(
+        p_val >= 0.01            ~ "Not Significant",
+        x_std > 0 & lag_y > 0   ~ "High-High",
+        x_std > 0 & lag_y <= 0  ~ "High-Low",
+        x_std <= 0 & lag_y > 0  ~ "Low-High",
+        x_std <= 0 & lag_y <= 0 ~ "Low-Low"
+      )
+    )
+})
+
+names(bv_lisa_results) <- map_chr(bv_pairs, ~ paste(.x$label_x, "x", .x$label_y))
+```
+
+```{r bv-lisa-table}
+bv_summary <- map_dfr(bv_lisa_results, function(df) {
+  tibble(
+    label_x               = df$label_x[1],
+    Outcome               = df$label_y[1],
+    `Mean Local Moran's I` = round(mean(df$bv_i, na.rm = TRUE), 4),
+    `High-High`           = sum(df$quad == "High-High"),
+    `Low-Low`             = sum(df$quad == "Low-Low"),
+    `% Significant`       = paste0(round(mean(df$p_val < 0.01) * 100, 1), "%")
+  )
+})
+
+##compute pack_rows group boundaries
+group_bounds <- bv_summary |>
+  mutate(row = row_number()) |>
+  group_by(label_x) |>
+  summarise(start = min(row), end = max(row), .groups = "drop")
+
+kbl <- bv_summary |>
+  select(-label_x) |>
+  knitr::kable(
+    caption = "Bivariate LISA Summary: Significant MGWR Predictors x Crime Outcome",
+    align   = c("l", "r", "r", "r", "r")
+  ) |>
+  kable_style()
+
+for (i in seq_len(nrow(group_bounds))) {
+  kbl <- kbl |>
+    kableExtra::pack_rows(group_bounds$label_x[i], group_bounds$start[i], group_bounds$end[i])
+}
+
+kbl
+```
+
+## Maps
+
+```{r bv-lisa-maps-paired, fig.show='asis'}
+bv_pred_names <- unique(map_chr(bv_pairs, ~ .x$label_x))
+
+for (pred in bv_pred_names) {
+  v_nm <- paste(pred, "x Violent Crime")
+  p_nm <- paste(pred, "x Property Crime")
+
+  make_bv_map <- function(nm, legend_title) {
+    tract_data |>
+      left_join(
+        bv_lisa_results[[nm]] |>
+          select(GEOID, quad) |>
+          mutate(quad = factor(quad, levels = c("High-High", "High-Low",
+                                                "Low-High",  "Low-Low",
+                                                "Not Significant"))),
+        by = "GEOID"
+      ) |>
+      lisa_map(nm, legend_title)
+  }
+
+  v_map <- if (v_nm %in% names(bv_lisa_results)) make_bv_map(v_nm, "BV LISA Cluster") else blank_panel
+  p_map <- if (p_nm %in% names(bv_lisa_results)) make_bv_map(p_nm, "BV LISA Cluster") else blank_panel
+
+  print(tmap_arrange(v_map, p_map, ncol = 2, outer.margins = 0))
+}
+```
