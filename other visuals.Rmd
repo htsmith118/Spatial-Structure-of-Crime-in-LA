@@ -1,0 +1,151 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+##ibm colorblind palette
+ibm_blue    <- "#648FFF"
+ibm_purple  <- "#785EF0"
+ibm_magenta <- "#DC267F"
+ibm_orange  <- "#FE6100"
+ibm_gold    <- "#FFB000"
+
+##styling
+theme_ibm <- function() {
+  theme_light() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.background = element_rect(fill = "#E8EEFF", color = NA),
+    strip.text       = element_text(face = "bold", size = 10, color = "#1a1a1a"),
+    axis.text        = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+}
+
+subtype_levels <- c("Theft", "Vehicle Theft", "Vandalism",
+                    "Burglary", "Shoplifting",
+                    "Assault", "Robbery", "Sexual Offenses", "Other Violent")
+```
+
+```{r xgb-subtype-f1-plot, fig.height=4, fig.width=6.5, fig.align="center"}
+xgb_f1_per_class <- c(
+  "Theft"           = 0.280,
+  "Vehicle Theft"   = 0.247,
+  "Vandalism"       = 0.139,
+  "Burglary"        = 0.223,
+  "Shoplifting"     = 0.398,
+  "Assault"         = 0.259,
+  "Robbery"         = 0.018,
+  "Sexual Offenses" = 0.000,
+  "Other Violent"   = 0.000
+)
+
+xgb_macro_f1 <- 0.233
+xgb_f1_type  <- 0.833                   
+
+tibble(
+  Subtype = factor(subtype_levels, levels = rev(subtype_levels)),
+  Type    = c(rep("Property", 5), rep("Violent", 4)),
+  F1      = xgb_f1_per_class[subtype_levels]
+) |>
+  ggplot(aes(x = Subtype, y = F1, fill = Type)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = xgb_macro_f1,
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_hline(yintercept = xgb_f1_type,
+             linetype = "dashed", color = ibm_blue, linewidth = 0.5) +
+  annotate("text", x = 0.6, y = xgb_macro_f1,
+           label = paste0(" Macro F1 = ", round(xgb_macro_f1, 3)),
+           vjust = -0.4, hjust = 0, size = 2.8, color = "gray40") +
+  annotate("text", x = 3, y = xgb_f1_type,
+           label = paste0("Crime Type F1 = ", round(xgb_f1_type, 3)),
+           vjust = -0.4, hjust = 1.1, size = 2.8, color = ibm_blue) +
+  scale_fill_manual(values = c("Property" = ibm_purple, "Violent" = ibm_magenta)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  coord_flip() +
+  labs(title    = "XGBoost Per-Subtype F1 Score",
+       subtitle = "Gray dashed = subtype macro F1; blue dashed = crime type F1",
+       x = NULL, y = "F1 Score", fill = NULL) +
+  theme_ibm() +
+  theme(legend.position = "bottom")
+```
+
+```{r type}
+##f1 and mcc comparison across all models - replace values with actual results
+model_metrics <- tibble(
+  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
+                      each = 2),
+                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
+  metric = rep(c("F1 Score", "MCC"), times = 4),
+  value  = c(
+    0.362, 0.148,  ## naive bayes
+    0.366, 0.154,  ## elastic net
+    0.375, 0.173,  ## random forest
+    0.833, 0.233   ## xgboost
+  )
+)
+
+ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
+  geom_text(
+    aes(label = sprintf("%.3f", value)),
+    position = position_dodge(width = 0.65),
+    vjust = -0.4, size = 3
+  ) +
+  scale_fill_manual(
+    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
+    name   = "Metric"
+  ) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Crime Type Model Performance: F1 Score and MCC",
+    x     = "Model",
+    y     = "Score"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "top")
+```
+
+```{r subtype}
+##f1 and mcc comparison across all models - replace values with actual results
+model_metrics <- tibble(
+  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
+                      each = 2),
+                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
+  metric = rep(c("F1 Score", "MCC"), times = 4),
+  value  = c(
+    0.228, 0.089,  ## naive bayes
+    0.057, 0.028,  ## elastic net
+    0.156, 0.094,  ## random forest
+    0.233, 0.121   ## xgboost
+  )
+)
+
+ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
+  geom_text(
+    aes(label = round(value, 3)),
+    position = position_dodge(width = 0.65),
+    vjust = -0.4, size = 3
+  ) +
+  scale_fill_manual(
+    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
+    name   = "Metric"
+  ) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Crime Subtype Model Performance: F1 Score and MCC",
+    x     = "Model",
+    y     = "Score"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "top")
+```
