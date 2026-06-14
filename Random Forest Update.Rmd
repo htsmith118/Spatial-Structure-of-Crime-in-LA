@@ -1,0 +1,743 @@
+---
+title: "Random Forest Classification"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(here)
+library(ranger)
+library(caret)
+library(yardstick)
+library(ggnewscale)
+library(knitr)
+library(kableExtra)
+library(mltools)
+
+incident_data <- read.csv(here("output", "clustered_incident_data.csv"))
+
+subtype_levels <- c("Theft", "Vehicle Theft", "Vandalism",
+                    "Burglary", "Shoplifting",
+                    "Assault", "Robbery", "Sexual Offenses", "Other Violent")
+
+##log-transform skewed continuous predictors; factorize outcome and cluster
+incident_data <- incident_data |>
+  mutate(
+    log_median_income = log(median_income),
+    log_total_pop     = log1p(total_pop),
+    outcome           = as.factor(outcome),
+    outcome_subtype = factor(outcome_subtype, levels = subtype_levels),
+    cluster           = factor(cluster)
+  )
+
+##ibm colorblind palette
+ibm_blue    <- "#648FFF"
+ibm_purple  <- "#785EF0"
+ibm_magenta <- "#DC267F"
+ibm_orange  <- "#FE6100"
+ibm_gold    <- "#FFB000"
+
+##styling
+theme_ibm <- function() {
+  theme_light() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.background = element_rect(fill = "#E8EEFF", color = NA),
+    strip.text       = element_text(face = "bold", size = 10, color = "#1a1a1a"),
+    axis.text        = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+}
+
+kable_style <- function(kbl) {
+  kbl |>
+    kableExtra::kable_styling(
+      latex_options = c("striped", "hold_position"),
+      stripe_color  = "#f5f5f5",
+      font_size     = 10
+    )
+}
+
+extract_f1 <- function(cm_obj) {
+  bs     <- cm_obj$byClass
+  f1_vec <- bs[, "F1"]
+  list(per_class = f1_vec,
+       macro     = mean(f1_vec, na.rm = TRUE))
+}
+
+compute_mcc <- function(preds, actuals) {
+  mltools::mcc(preds = as.factor(preds), actuals = as.factor(actuals))
+}
+```
+
+\newpage
+
+# Crime Type Classification
+
+```{r predictors}
+##full predictor pool: socioeconomic, demographic, and cluster membership
+predictor_pool <- c(
+  "log_median_income",
+  "gini",
+  "poverty_rate",
+  "no_vehicle_rate",
+  "housing_burden_rate",
+  "vacancy_rate",
+  "renter_rate",
+  "single_parent_rate",
+  "lang_isolation_rate",
+  "internet_rate",
+  "log_total_pop",
+  "median_age",
+  "pct_black",
+  "pct_asian",
+  "edu_rate_no_hsdip",
+  "disability_rate",
+  "cluster"
+)
+
+##drop rows with missing values on any predictor
+incident_data <- incident_data |>
+  filter(if_all(all_of(predictor_pool), ~ !is.na(.)))
+```
+
+```{r split}
+##80/20 train-test split
+set.seed(490)
+
+train_idx <- sample(
+  seq_len(nrow(incident_data)),
+  size = floor(0.80 * nrow(incident_data))
+)
+
+train <- incident_data[train_idx, ]
+test  <- incident_data[-train_idx, ]
+```
+
+## Hyperparameter Tuning
+
+```{r mtry-tune, cache=TRUE}
+rf_formula <- as.formula(
+  paste("outcome ~", paste(predictor_pool, collapse = " + "))
+)
+
+##mtry fixed at 6 (sqrt(17) default) based on prior run showing flat F1 across all mtry
+##tuning budget focused on min.node.size; 100 trees during CV, 300 for final fit
+min_node_grid <- c(1, 5, 10, 20, 30)
+
+set.seed(490)
+folds <- createFolds(train$outcome, k = 5, list = TRUE, returnTrain = TRUE)
+
+##5-fold CV over min.node.size, selecting on mean F1
+mtry_cv <- map_dfr(min_node_grid, function(mn) {
+  fold_f1 <- sapply(seq_along(folds), function(i) {
+    tr  <- train[folds[[i]], ]
+    val <- train[-folds[[i]], ]
+
+    ##upsample minority class within fold to correct imbalance
+    tr_up <- upSample(x = tr[, predictor_pool],
+                      y = tr$outcome,
+                      yname = "outcome")
+
+    fit <- ranger(
+      rf_formula,
+      data          = tr_up,
+      num.trees     = 100,
+      mtry          = 6,
+      min.node.size = mn,
+      num.threads   = parallel::detectCores() - 1,
+      verbose       = FALSE,
+      seed          = 490
+    )
+
+    preds <- predict(fit, data = val)$predictions
+    y_val <- factor(val$outcome, levels = c("0", "1"))
+    cm_t  <- confusionMatrix(preds, y_val, positive = "1")
+    prec  <- cm_t$byClass["Pos Pred Value"]
+    rec   <- cm_t$byClass["Sensitivity"]
+    ifelse(is.na(prec) | is.na(rec) | (prec + rec) == 0,
+           0, 2 * prec * rec / (prec + rec))
+  })
+
+  tibble(min_node = mn, mean_f1 = mean(fold_f1), sd_f1 = sd(fold_f1))
+})
+
+best_min_node <- mtry_cv$min_node[which.max(mtry_cv$mean_f1)]
+best_mtry     <- 6
+```
+
+```{r mtry-cv-table}
+##cv results across min.node.size; mtry fixed at 6
+mtry_cv |>
+  mutate(
+    mean_f1  = round(mean_f1, 4),
+    sd_f1    = round(sd_f1,   4),
+    Selected = if_else(min_node == best_min_node, "Yes", "")
+  ) |>
+  knitr::kable(
+    caption   = "5-Fold CV F1 by min.node.size (mtry fixed at 6)",
+    col.names = c("min.node.size", "Mean CV F1", "SD", "Selected"),
+    align     = c("r", "r", "r", "c")
+  ) |>
+  kable_style()
+```
+
+```{r mtry-plot, fig.width=6, fig.height=4, out.width="80%", fig.align="center"}
+##mtry fixed at 6; plot min.node.size on x-axis
+ggplot(mtry_cv, aes(x = min_node, y = mean_f1)) +
+  geom_ribbon(aes(ymin = mean_f1 - sd_f1,
+                  ymax = mean_f1 + sd_f1),
+              fill = ibm_blue, alpha = 0.15) +
+  geom_line(color = ibm_blue, linewidth = 0.9) +
+  geom_point(size = 3, color = ibm_blue) +
+  geom_point(
+    data   = filter(mtry_cv, min_node == best_min_node),
+    size   = 4,
+    shape  = 21,
+    fill   = ibm_orange,
+    color  = "white",
+    stroke = 1.5
+  ) +
+  scale_x_continuous(breaks = min_node_grid) +
+  labs(
+    title    = "5-Fold CV F1 by min.node.size (mtry fixed at 6)",
+    subtitle = paste0("Optimal min.node.size = ", best_min_node,
+                      " (highlighted); shaded band = \u00b11 SD"),
+    x        = "min.node.size",
+    y        = "Mean CV F1"
+  ) +
+  theme_ibm()
+```
+
+\newpage
+
+## Threshold Tuning
+
+```{r threshold-tune, cache=TRUE}
+##sweep classification thresholds using the same 5 folds
+##probability = TRUE required to get calibrated probabilities for threshold sweep
+thresholds <- seq(0.05, 0.95, by = 0.01)
+fold_f1    <- matrix(NA, nrow = 5, ncol = length(thresholds))
+
+for (i in seq_along(folds)) {
+  tr  <- train[folds[[i]], ]
+  val <- train[-folds[[i]], ]
+
+  ##upsample minority class within fold
+  tr_up <- upSample(x = tr[, predictor_pool],
+                    y = tr$outcome,
+                    yname = "outcome")
+
+  fit <- ranger(
+    rf_formula,
+    data          = tr_up,
+    num.trees     = 100,
+    mtry          = best_mtry,
+    min.node.size = best_min_node,
+    probability   = TRUE,
+    num.threads   = parallel::detectCores() - 1,
+    verbose       = FALSE,
+    seed          = 490
+  )
+
+  probs <- predict(fit, data = val)$predictions[, "1"]
+  y_val <- factor(val$outcome, levels = c("0", "1"))
+
+  for (j in seq_along(thresholds)) {
+    preds <- factor(ifelse(probs > thresholds[j], 1, 0),
+                    levels = levels(y_val))
+    cm_t  <- confusionMatrix(preds, y_val, positive = "1")
+    prec  <- cm_t$byClass["Pos Pred Value"]
+    rec   <- cm_t$byClass["Sensitivity"]
+    fold_f1[i, j] <- ifelse(
+      is.na(prec) | is.na(rec) | (prec + rec) == 0,
+      0, 2 * prec * rec / (prec + rec)
+    )
+  }
+}
+
+mean_f1      <- colMeans(fold_f1, na.rm = TRUE)
+best_thr     <- thresholds[which.max(mean_f1)]
+best_thr_idx <- which.max(mean_f1)
+
+##per-fold F1 at selected threshold
+tibble(
+  Fold = as.character(1:5),
+  F1   = round(fold_f1[, best_thr_idx], 4)
+) |>
+  bind_rows(tibble(Fold = "Mean",
+                   F1   = round(mean(fold_f1[, best_thr_idx]), 4))) |>
+  knitr::kable(
+    caption   = paste0("5-Fold CV F1 at Selected Threshold (", best_thr, ")"),
+    col.names = c("Fold", "F1")
+  ) |>
+  kable_style()
+```
+
+```{r threshold-plot, fig.width=8, fig.height=4, out.width="100%"}
+tibble(Threshold = thresholds, MeanF1 = mean_f1) |>
+  ggplot(aes(x = Threshold, y = MeanF1)) +
+  geom_line(color = ibm_blue, linewidth = 0.9) +
+  geom_vline(xintercept = best_thr,
+             linetype = "dashed", color = ibm_orange, linewidth = 0.6) +
+  annotate("text", x = best_thr, y = min(mean_f1),
+           label = paste0("Threshold = ", best_thr),
+           hjust = -0.1, size = 2.8, color = "gray30") +
+  scale_x_continuous(breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Mean CV F1 Across Thresholds",
+    subtitle = paste0("mtry = ", best_mtry, ", min.node.size = ", best_min_node,
+                      "; orange dashed line marks CV-selected threshold"),
+    x        = "Classification Threshold",
+    y        = "Mean CV F1"
+  ) +
+  theme_ibm()
+```
+
+```{r train, cache=TRUE}
+##upsample full training set before final fit
+train_up <- upSample(x = train[, predictor_pool],
+                     y = train$outcome,
+                     yname = "outcome")
+
+##refit with best params and probability = TRUE for threshold application
+rf_model <- ranger(
+  rf_formula,
+  data          = train_up,
+  num.trees     = 300,
+  mtry          = best_mtry,
+  min.node.size = best_min_node,
+  importance    = "permutation",
+  probability   = TRUE,
+  num.threads   = parallel::detectCores() - 1,
+  verbose       = FALSE,
+  seed          = 490
+)
+```
+
+\newpage
+
+## Model Performance
+
+```{r confusion-matrix, fig.height=3.8, fig.width=4.5, fig.align="center"}
+pred_prob   <- predict(rf_model, data = test)$predictions[, "1"]
+predictions <- factor(ifelse(pred_prob > best_thr, 1, 0),
+                      levels = levels(test$outcome))
+
+cm_rf <- confusionMatrix(predictions, test$outcome, positive = "1")
+
+cm_data <- as.data.frame(cm_rf$table) |>
+  rename(Predicted = Prediction, Actual = Reference) |>
+  mutate(
+    Actual    = factor(Actual,    levels = c("1", "0")),
+    Predicted = factor(Predicted, levels = c("0", "1")),
+    class_label = case_when(
+      Predicted == "0" & Actual == "0" ~ "True Negative",
+      Predicted == "1" & Actual == "1" ~ "True Positive",
+      Predicted == "1" & Actual == "0" ~ "False Positive",
+      Predicted == "0" & Actual == "1" ~ "False Negative"
+    ),
+    correct = Predicted == Actual,
+    pct     = round(Freq / sum(Freq) * 100, 1),
+    label   = paste0(formatC(Freq, format = "d", big.mark = ","),
+                     "\n(", pct, "%)")
+  )
+
+ggplot(cm_data, aes(x = Actual, y = Predicted)) +
+  geom_tile(data = filter(cm_data, correct),
+            aes(fill = Freq), color = "white", linewidth = 1.2) +
+  scale_fill_gradient(low = "#F5E6FF", high = ibm_magenta,
+                      guide = "none") +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = filter(cm_data, !correct),
+            aes(fill = Freq), color = "white", linewidth = 1.2) +
+  scale_fill_gradient(low = "#E8F0FF", high = ibm_blue,
+                      guide = "none") +
+  geom_text(aes(label = label), size = 3.8, fontface = "bold") +
+  geom_text(aes(label = class_label),
+            vjust = 4.5, size = 2.6, color = "gray20") +
+  scale_x_discrete(labels = c("1" = "Violent", "0" = "Property")) +
+  scale_y_discrete(labels = c("1" = "Violent", "0" = "Property")) +
+  labs(title    = "Confusion Matrix: Crime Type",
+       subtitle = paste0("mtry = ", best_mtry, ", min.node.size = ", best_min_node,
+                         ", threshold = ", best_thr),
+       x = "Actual Class", y = "Predicted Class") +
+  theme_ibm() +
+  theme(panel.grid = element_blank(), axis.ticks = element_blank())
+```
+
+```{r performance}
+##build results tibble for yardstick metrics
+results <- tibble(
+  truth    = test$outcome,
+  estimate = predictions
+)
+
+##f1 and mcc via yardstick for consistency with other models
+f1  <- f_meas(results, truth = truth, estimate = estimate, event_level = "second")$.estimate
+mcc <- yardstick::mcc(results, truth = truth, estimate = estimate)$.estimate
+
+tibble(
+  Metric = c(
+    "F1 Score",
+    "Matthews Correlation Coefficient",
+    "Accuracy",
+    "Sensitivity / Recall",
+    "Specificity",
+    "Precision",
+    "Balanced Accuracy"
+  ),
+  Value = round(c(
+    f1,
+    mcc,
+    cm_rf$overall["Accuracy"],
+    cm_rf$byClass["Sensitivity"],
+    cm_rf$byClass["Specificity"],
+    cm_rf$byClass["Pos Pred Value"],
+    cm_rf$byClass["Balanced Accuracy"]
+  ), 4)
+) |>
+  knitr::kable(
+    caption = "Random Forest Classification Performance",
+    align   = c("l", "r")
+  ) |>
+  kable_style()
+```
+
+\newpage
+
+## Variable Importance
+
+```{r importance, fig.width=9, fig.height=6, out.width="100%"}
+importance_df <- data.frame(
+  Variable   = names(rf_model$variable.importance),
+  Importance = rf_model$variable.importance
+) |>
+  arrange(desc(Importance)) |>
+  mutate(
+    Variable = recode(
+      Variable,
+      log_median_income   = "Median Income (log)",
+      gini                = "Gini Coefficient",
+      poverty_rate        = "Poverty Rate",
+      no_vehicle_rate     = "No Vehicle Rate",
+      housing_burden_rate = "Housing Burden Rate",
+      vacancy_rate        = "Vacancy Rate",
+      renter_rate         = "Renter Rate",
+      single_parent_rate  = "Single-Parent Rate",
+      lang_isolation_rate = "Language Isolation Rate",
+      internet_rate       = "Internet Access Rate",
+      log_total_pop       = "Total Population (log)",
+      median_age          = "Median Age",
+      pct_black           = "% Black",
+      pct_asian           = "% Asian",
+      edu_rate_no_hsdip   = "No HS Diploma Rate",
+      disability_rate     = "Disability Rate",
+      cluster             = "Neighborhood Cluster"
+    )
+  )
+
+ggplot(
+  importance_df,
+  aes(
+    x = reorder(Variable, Importance),
+    y = Importance
+  )
+) +
+  geom_col(fill = ibm_blue) +
+  coord_flip() +
+  labs(
+    title    = "Random Forest Variable Importance",
+    x        = NULL,
+    y        = "Mean Decrease in Accuracy"
+  ) +
+  theme_ibm()
+```
+
+\newpage
+
+# Crime Subtype Classification
+
+## Hyperparameter Tuning
+
+```{r subtype-mtry-tune, cache=TRUE}
+subtype_formula <- as.formula(
+  paste("outcome_subtype ~", paste(predictor_pool, collapse = " + "))
+)
+
+##mtry fixed at 10 based on prior run showing flat macro F1 across all mtry
+##tuning budget focused on min.node.size; 100 trees during CV, 300 for final fit
+set.seed(490)
+subtype_folds <- createFolds(train$outcome_subtype, k = 5,
+                             list = TRUE, returnTrain = TRUE)
+
+subtype_mtry_cv <- map_dfr(min_node_grid, function(mn) {
+  fold_f1 <- sapply(seq_along(subtype_folds), function(i) {
+    tr  <- train[subtype_folds[[i]], ]
+    val <- train[-subtype_folds[[i]], ]
+
+    ##upsample all minority subtypes within fold
+    tr_up <- upSample(x = tr[, predictor_pool],
+                      y = tr$outcome_subtype,
+                      yname = "outcome_subtype")
+
+    fit <- ranger(
+      subtype_formula,
+      data          = tr_up,
+      num.trees     = 100,
+      mtry          = 10,
+      min.node.size = mn,
+      num.threads   = parallel::detectCores() - 1,
+      verbose       = FALSE,
+      seed          = 490
+    )
+
+    preds <- predict(fit, data = val)$predictions
+    y_val <- factor(val$outcome_subtype, levels = subtype_levels)
+    cm_t  <- confusionMatrix(preds, y_val)
+    mean(cm_t$byClass[, "F1"], na.rm = TRUE)
+  })
+
+  tibble(min_node = mn, mean_f1 = mean(fold_f1), sd_f1 = sd(fold_f1))
+})
+
+best_min_node_subtype <- subtype_mtry_cv$min_node[which.max(subtype_mtry_cv$mean_f1)]
+best_mtry_subtype     <- 10
+```
+
+```{r subtype-mtry-table}
+subtype_mtry_cv |>
+  mutate(
+    mean_f1  = round(mean_f1, 4),
+    sd_f1    = round(sd_f1,   4),
+    Selected = if_else(min_node == best_min_node_subtype, "Yes", "")
+  ) |>
+  knitr::kable(
+    caption   = "5-Fold CV Macro F1 by min.node.size (mtry fixed at 10)",
+    col.names = c("min.node.size", "Mean CV Macro F1", "SD", "Selected"),
+    align     = c("r", "r", "r", "c")
+  ) |>
+  kable_style()
+```
+
+```{r subtype-mtry-plot, fig.width=6, fig.height=4, out.width="80%", fig.align="center"}
+##mtry fixed at 10; plot min.node.size on x-axis
+ggplot(subtype_mtry_cv, aes(x = min_node, y = mean_f1)) +
+  geom_ribbon(aes(ymin = mean_f1 - sd_f1,
+                  ymax = mean_f1 + sd_f1),
+              fill = ibm_blue, alpha = 0.15) +
+  geom_line(color = ibm_blue, linewidth = 0.9) +
+  geom_point(size = 3, color = ibm_blue) +
+  geom_point(
+    data   = filter(subtype_mtry_cv, min_node == best_min_node_subtype),
+    size   = 4,
+    shape  = 21,
+    fill   = ibm_orange,
+    color  = "white",
+    stroke = 1.5
+  ) +
+  scale_x_continuous(breaks = min_node_grid) +
+  labs(
+    title    = "5-Fold CV Macro F1 by min.node.size (Crime Subtype)",
+    subtitle = paste0("mtry fixed at 10; optimal min.node.size = ",
+                      best_min_node_subtype,
+                      " (highlighted); shaded band = \u00b11 SD"),
+    x        = "min.node.size",
+    y        = "Mean CV Macro F1"
+  ) +
+  theme_ibm()
+```
+
+## Final Model
+
+```{r subtype-train, cache=TRUE}
+##upsample full training set before final subtype fit
+train_up_sub <- upSample(x = train[, predictor_pool],
+                         y = train$outcome_subtype,
+                         yname = "outcome_subtype")
+
+rf_subtype <- ranger(
+  subtype_formula,
+  data          = train_up_sub,
+  num.trees     = 300,
+  mtry          = best_mtry_subtype,
+  min.node.size = best_min_node_subtype,
+  importance    = "permutation",
+  num.threads   = parallel::detectCores() - 1,
+  seed          = 490
+)
+```
+
+## Performance
+
+```{r subtype-cm, fig.height=5.5, fig.width=7, fig.align="center"}
+test_outcome_subtype <- factor(test$outcome_subtype, levels = subtype_levels)
+pred_subtype         <- predict(rf_subtype, data = test)$predictions
+
+cm_subtype  <- confusionMatrix(pred_subtype, test_outcome_subtype)
+f1_subtype  <- extract_f1(cm_subtype)
+mcc_subtype <- compute_mcc(pred_subtype, test_outcome_subtype)
+
+as.data.frame(cm_subtype$table) |>
+  rename(Predicted = Prediction, Actual = Reference) |>
+  mutate(
+    Predicted    = factor(Predicted, levels = rev(subtype_levels)),
+    Actual       = factor(Actual,    levels = subtype_levels),
+    fill_cat     = case_when(
+      Freq == 0           ~ "empty",
+      Predicted == Actual ~ "correct",
+      TRUE                ~ "incorrect"
+    ),
+    alpha_scaled = case_when(
+      Freq == 0 ~ 0.35,
+      TRUE      ~ 0.15 + 0.85 * (Freq / max(Freq))
+    )
+  ) |>
+  ggplot(aes(x = Actual, y = Predicted)) +
+  geom_tile(aes(fill = fill_cat, alpha = alpha_scaled),
+            color = "white", linewidth = 0.6) +
+  geom_text(aes(label = ifelse(Freq > 0,
+                               formatC(Freq, format = "d", big.mark = ","), "")),
+            size = 2.2, fontface = "bold") +
+  scale_fill_manual(values = c("correct"   = ibm_magenta,
+                               "incorrect" = ibm_blue,
+                               "empty"     = "gray70"),
+                    labels  = c("correct"   = "True",
+                                "incorrect" = "False",
+                                "empty"     = "No predictions"),
+                    name    = NULL) +
+  scale_alpha_continuous(range = c(0.15, 1), guide = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 35)) +
+  labs(title    = "Confusion Matrix: Crime Subtype",
+       subtitle = paste0("mtry = ", best_mtry_subtype,
+                         ", min.node.size = ", best_min_node_subtype),
+       x = "Actual Subtype", y = "Predicted Subtype") +
+  theme_ibm() +
+  theme(panel.grid      = element_blank(),
+        axis.ticks      = element_blank(),
+        axis.text       = element_text(size = 7),
+        legend.position = "bottom")
+```
+
+```{r subtype-per-class-f1}
+tibble(
+  Subtype = subtype_levels,
+  Type    = c(rep("Property", 5), rep("Violent", 4)),
+  F1      = round(f1_subtype$per_class[paste0("Class: ", subtype_levels)], 3)
+) |>
+  knitr::kable(caption = "Per-Subtype F1 Score",
+               col.names = c("Subtype", "Type", "F1")) |>
+  kable_style() |>
+  kableExtra::pack_rows("Property", 1, 5, bold = TRUE, background = "#e8e8e8") |>
+  kableExtra::pack_rows("Violent",  6, 9, bold = TRUE, background = "#e8e8e8")
+```
+
+```{r subtype-f1-plot, fig.height=4, fig.width=6.5, fig.align="center"}
+f1_type <- f_meas(
+  tibble(truth    = test$outcome,
+         estimate = predictions),
+  truth = truth, estimate = estimate, event_level = "second"
+)$.estimate
+
+tibble(
+  Subtype = factor(subtype_levels, levels = rev(subtype_levels)),
+  Type    = c(rep("Property", 5), rep("Violent", 4)),
+  F1      = f1_subtype$per_class[paste0("Class: ", subtype_levels)]
+) |>
+  ggplot(aes(x = Subtype, y = F1, fill = Type)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = f1_subtype$macro,
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_hline(yintercept = f1_type,
+             linetype = "dashed", color = ibm_blue, linewidth = 0.5) +
+  annotate("text", x = 0.6, y = f1_subtype$macro,
+           label = paste0(" Macro F1 = ", round(f1_subtype$macro, 3)),
+           vjust = -0.4, hjust = 0, size = 2.8, color = "gray40") +
+  annotate("text", x = 3, y = f1_type,
+         label = paste0("Crime Type F1 = ", round(f1_type, 3)),
+         vjust = -0.4, hjust = 1.1, size = 2.8, color = ibm_blue) +
+  scale_fill_manual(values = c("Property" = ibm_purple, "Violent" = ibm_magenta)) +
+  scale_y_continuous(
+    limits = c(0, max(f1_subtype$per_class, f1_type, na.rm = TRUE) * 1.18)
+  ) +
+  coord_flip() +
+  labs(title    = "Per-Subtype F1 Score",
+       subtitle = "Gray dashed = subtype macro F1; blue dashed = crime type F1",
+       x = NULL, y = "F1 Score", fill = NULL) +
+  theme_ibm() +
+  theme(legend.position = "bottom")
+```
+
+```{r subtype-overall}
+tibble(
+  Metric = c("Macro F1", "MCC", "Weighted F1", "Overall Accuracy"),
+  Value  = round(c(
+    f1_subtype$macro,
+    mcc_subtype,
+    sum(f1_subtype$per_class *
+          (table(test_outcome_subtype) / length(test_outcome_subtype)),
+        na.rm = TRUE),
+    cm_subtype$overall["Accuracy"]
+  ), 4)
+) |>
+  knitr::kable(caption = "Overall Crime Subtype Performance (Test Set)",
+               col.names = c("Metric", "Value")) |>
+  kable_style()
+```
+
+```{r subtype-importance, fig.width=9, fig.height=6, out.width="100%"}
+importance_df_sub <- data.frame(
+  Variable   = names(rf_subtype$variable.importance),
+  Importance = rf_subtype$variable.importance
+) |>
+  arrange(desc(Importance)) |>
+  mutate(
+    Variable = recode(
+      Variable,
+      log_median_income   = "Median Income (log)",
+      gini                = "Gini Coefficient",
+      poverty_rate        = "Poverty Rate",
+      no_vehicle_rate     = "No Vehicle Rate",
+      housing_burden_rate = "Housing Burden Rate",
+      vacancy_rate        = "Vacancy Rate",
+      renter_rate         = "Renter Rate",
+      single_parent_rate  = "Single-Parent Rate",
+      lang_isolation_rate = "Language Isolation Rate",
+      internet_rate       = "Internet Access Rate",
+      log_total_pop       = "Total Population (log)",
+      median_age          = "Median Age",
+      pct_black           = "% Black",
+      pct_asian           = "% Asian",
+      edu_rate_no_hsdip   = "No HS Diploma Rate",
+      disability_rate     = "Disability Rate",
+      cluster             = "Neighborhood Cluster"
+    )
+  )
+
+ggplot(
+  importance_df_sub,
+  aes(
+    x = reorder(Variable, Importance),
+    y = Importance
+  )
+) +
+  geom_col(fill = ibm_blue) +
+  coord_flip() +
+  labs(
+    title    = "Random Forest Variable Importance: Crime Subtype",
+    x        = NULL,
+    y        = "Mean Decrease in Accuracy"
+  ) +
+  theme_ibm()
+```
