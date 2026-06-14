@@ -53,26 +53,6 @@ Crime in Los Angeles is not randomly distributed. This project combines LAPD cri
 
 ---
 
-## Repository Structure
-
-```
-├── data/
-│   ├── raw/              # Raw LAPD and ACS data
-│   └── processed/        # Cleaned and joined datasets
-├── scripts/
-│   ├── 01_data_cleaning.R
-│   ├── 02_eda.R
-│   ├── 03_clustering.R
-│   ├── 04_classification.R
-│   └── 05_spatial_analysis.R
-├── outputs/
-│   ├── figures/          # All visualizations
-│   └── models/           # Saved model objects
-└── README.md
-```
-
----
-
 ## Dependencies
 
 All analysis was conducted in R. Key packages:
