@@ -1,0 +1,655 @@
+---
+title: "XGBoost Model"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r Libraries_and_Data}
+
+# In General
+library(dplyr)
+
+# Model
+library(xgboost)
+library(mltools)
+library(tidymodels)
+library(themis)     # step_downsample()
+library(doParallel) # Parallel Cluster
+
+# Model Significance + Visualizations + Testing Variable Importance
+library(vip)
+library(shapviz)
+library(DALEXtra) # Extension for tidymodels integration
+library(ggplot2)
+library(scales)
+library(yardstick)
+library(purrr)
+library(ggnewscale)
+library(forcats)
+library(here)
+
+# Importing & Preparing Data
+incident_data <- read.csv(here("output", "clustered_incident_data.csv"))
+
+```
+
+
+```{r Preparing_Model_t}
+
+xgb_data_t <- incident_data %>%
+  select(!1:7 & !9:10) %>%
+  mutate(crime_weight = importance_weights(crime_weight)) %>%
+  mutate(outcome = as.factor(outcome)) %>%
+  mutate(cluster = as.factor(cluster))
+
+str(xgb_data_t)
+
+
+set.seed(12345)
+data_split_t <- initial_split(xgb_data_t, prop = 0.8, strata = outcome)
+train_data_t <- training(data_split_t)
+test_data_t  <- testing(data_split_t)
+
+cv_folds_t <- vfold_cv(train_data_t, v = 5, strata = outcome)
+
+xgb_specs_t <- boost_tree(trees = 1000,
+                          tree_depth = 4,
+                          learn_rate = 0.05,
+                          mtry = 15,
+                          min_n = 10,
+                          stop_iter = 30) %>%
+               set_engine("xgboost", event_level = "second",
+                          tree_method = "hist",
+                          nthread = parallel::detectCores() - 1) %>%
+               set_mode("classification")
+
+xgb_recipe_t <- recipe(outcome ~ ., data = train_data_t) %>%
+  step_dummy(cluster) %>%
+  step_downsample(outcome, under_ratio = 1.5)
+
+xgb_workflow_t <- workflow() %>%
+  add_recipe(xgb_recipe_t) %>%
+  add_model(xgb_specs_t)
+
+```
+
+
+```{r Fitting_Model_t}
+
+# Start The Parallel Cluster
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+set.seed(12345)
+cv_results_t <- fit_resamples(xgb_workflow_t,
+                              resamples = cv_folds_t,                  
+                              metrics = metric_set(f_meas, yardstick::mcc),
+                              control = control_resamples(save_pred = TRUE))
+
+final_workflow_t <- finalize_workflow(xgb_workflow_t,
+                                      select_best(cv_results_t,
+                                                  metric = "f_meas"))
+
+final_results_t <- last_fit(final_workflow_t,
+                            split = data_split_t,
+                            metrics = metric_set(f_meas, yardstick::mcc))
+
+# Stop The Parallel Cluster
+stopCluster(cl)
+
+```
+
+
+```{r Model_Performance_t}
+
+model_metrics_t = collect_metrics(final_results_t, summarize = TRUE)
+print(model_metrics_t)
+collect_predictions(final_results_t) %>%
+  conf_mat(truth = outcome, estimate = .pred_class)
+
+```
+
+
+```{r Confusion_Matrix_t}
+
+ibm_magenta <- "#d81b60" 
+ibm_blue    <- "#5c92ff"
+
+cm_object_t <- conf_mat(collect_predictions(final_results_t), truth = outcome, estimate = .pred_class)
+cm_data_t <- as.data.frame(cm_object_t$table)
+colnames(cm_data_t) <- c("Estimate", "Truth", "Count")
+
+cm_data_t <- cm_data_t %>%
+  mutate(Estimate = fct_rev(as.factor(Estimate)),
+         Truth = as.factor(Truth), 
+         correct = (as.character(Estimate) == as.character(Truth)),
+         pct = Count / sum(Count),
+         pct_text = paste0("(", label_percent(accuracy = 0.1)(pct), ")"),
+         class_label = case_when(
+           Truth == "1" & Estimate == "1" ~ "True Positive",
+           Truth == "0" & Estimate == "1" ~ "False Positive",
+           Truth == "1" & Estimate == "0" ~ "False Negative",
+           Truth == "0" & Estimate == "0" ~ "True Negative"),
+         main_label = paste0(comma(Count), "\n", pct_text))
+
+ggplot(cm_data_t, aes(x = Truth, y = Estimate)) +
+  geom_tile(data = filter(cm_data_t,
+                          correct),
+            aes(fill = Count),
+            color = "white",
+            linewidth = 1.2) +
+  scale_fill_gradient(low = "#F5E6FF",
+                      high = ibm_magenta,
+                      guide = "none") +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = filter(cm_data_t, !correct),
+            aes(fill = Count),
+            color = "white",
+            linewidth = 1.2) +
+  scale_fill_gradient(low = "#E8F0FF",
+                      high = ibm_blue,
+                      guide = "none") +
+  geom_text(aes(label = main_label),
+            size = 3.8,
+            fontface = "bold",
+            lineheight = 1.2) +
+  geom_text(aes(label = class_label),
+            vjust = 4.5,
+            size = 2.6,
+            color = "gray20") +
+  scale_x_discrete(labels = c("1" = "Violent", "0" = "Property")) +
+  scale_y_discrete(labels = c("1" = "Violent", "0" = "Property")) +
+  labs(title = "Confusion Matrix: Crime Type",
+       x = "Actual Class", 
+       y = "Predicted Class") +
+  theme_minimal(base_size = 13) + 
+  theme(plot.title = element_text(face = "bold",
+                                  size = 16,
+                                  margin = margin(b = 4)),
+        plot.subtitle = element_text(color = "gray40",
+                                     size = 11,
+                                     margin = margin(b = 15)),
+        axis.title = element_text(face = "bold",
+                                  size = 13),
+        axis.text = element_text(color = "gray30",
+                                 size = 11,
+                                 face = "italic"),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = NA,
+                                        color = "gray90",
+                                        linewidth = 0.5))
+
+
+```
+
+
+```{r Prepare_For_Data_Visualizations_t}
+
+final_xgb_t <- extract_fit_engine(final_results_t)
+trained_workflow_t <- extract_workflow(final_results_t)
+
+set.seed(123)
+sampled_test_t <- test_data_t %>%
+  group_by(outcome) %>%
+  slice_sample(prop = 1000 / nrow(test_data_t)) %>%
+  ungroup()
+
+features_sample_t <- trained_workflow_t %>%
+  extract_recipe() %>%
+  bake(new_data = sampled_test_t, all_predictors()) %>%
+  as.matrix()
+
+```
+
+
+```{r SHAP_t, fig.height = 6, fig.width = 8}
+
+shp_t <- shapviz(final_xgb_t, X_pred = features_sample_t, interactions = FALSE)
+
+shp_beeswarm_t <- sv_importance(shp_t,
+                                kind = "beeswarm",
+                                show_numbers = TRUE,
+                                max_display = 22) +
+  scale_color_viridis_c(option = "plasma",
+                        breaks = c(0, 1),
+                        labels = c("Low", "High"),
+                        name = "Feature Value") +
+  scale_x_continuous(
+    limits = c(-0.8, 0.8),
+    breaks = seq(-0.8, 0.8, by = 0.4)) +
+  labs(title = "SHAP Values Summary",
+       subtitle = "Socio-economic features on crime classification",
+       x = "Property Crime   -{ SHAP Value }-    Violent Crime",
+       y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 14,
+                                  margin = margin(b = 5)),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(color =
+                                            "gray90",
+                                          linewidth = 0.5),
+        panel.grid.major.x = element_line(color = "gray95"),
+        axis.text.y = element_text(color = "black",
+                                   face = "italic"),
+        legend.title = element_text(size = 10,
+                                    face = "bold"))
+
+shp_beeswarm_t
+
+```
+
+
+```{r Violent_Permutation}
+
+custom_violent_f1_loss <- function(observed, predicted) {
+  obs_factor  <- factor(observed, levels = c(0, 1))
+  pred_factor <- factor(ifelse(predicted >= 0.5, 1, 0), levels = c(0, 1))
+  
+  f1 <- yardstick::f_meas_vec(obs_factor, pred_factor, event_level = "second")
+  
+  return(1 - f1)
+}
+
+set.seed(12345)
+violent_explainer_xgb <- explain_tidymodels(
+  model = trained_workflow_t,
+  data = train_data_t %>% select(-outcome),
+  y = as.numeric(train_data_t$outcome == "1"),
+  label = "XGBoost Model: Violent Crime Predictors",
+  verbose = FALSE
+)
+
+set.seed(12345)
+violent_vip_permutation <- model_parts(
+  explainer = violent_explainer_xgb,
+  loss_function = custom_violent_f1_loss,
+  B = 5
+)
+
+```
+
+
+```{r Property_Permutation}
+
+custom_property_f1_loss <- function(observed, predicted) {
+  obs_factor  <- factor(observed, levels = c(0, 1))
+  pred_factor <- factor(ifelse(predicted >= 0.5, 1, 0), levels = c(0, 1))
+  
+  f1 <- yardstick::f_meas_vec(obs_factor, pred_factor, event_level = "first")
+  
+  return(1 - f1)
+}
+
+set.seed(12345)
+property_explainer_xgb <- explain_tidymodels(
+  model = trained_workflow_t,
+  data = train_data_t %>% select(-outcome),
+  y = as.numeric(train_data_t$outcome == "0"),
+  label = "XGBoost Model: Property Crime Predictors",
+  verbose = FALSE
+)
+
+set.seed(12345)
+property_vip_permutation <- model_parts(
+  explainer = property_explainer_xgb,
+  loss_function = custom_property_f1_loss,
+  B = 5
+)
+
+```
+
+
+```{r Violent_Permutation_Plot}
+
+violent_vip_p <- plot(violent_vip_permutation)
+
+violent_plot <- violent_vip_p +
+  labs(title = "Permutation Feature Importance for Violent Crimes",
+       subtitle = "Model performance degradation measured via unweighted Macro F1-Score",
+       x = NULL,
+       y = "Loss (1 - F1) After Variable Permutation") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 14,
+                                  margin = margin(b = 5)),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(color = "gray90",
+                                          linewidth = 0.5),
+        panel.grid.major.x = element_line(color = "gray95"),
+        axis.text.y = element_text(color = "black",
+                                   face = "italic"),
+        legend.position = "none")
+
+print(violent_plot)
+
+```
+
+
+```{r Property_Permutation_Plot}
+
+property_p <- plot(property_vip_permutation)
+
+property_plot <- property_p +
+  labs(title = "Permutation Feature Importance for Property Crimes",
+       subtitle = "Model performance degradation measured via unweighted Macro F1-Score",
+       x = NULL,
+       y = "Loss (1 - F1) After Variable Permutation") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 14,
+                                  margin = margin(b = 5)),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(color = "gray90",
+                                          linewidth = 0.5),
+        panel.grid.major.x = element_line(color = "gray95"),
+        axis.text.y = element_text(color = "black",
+                                   face = "italic"),
+        legend.position = "none")
+
+print(property_plot)
+
+```
+
+
+
+
+```{r Preparing_Model_st}
+
+xgb_data_st <- incident_data %>%
+  select(!1:8 & !10) %>%
+  mutate(crime_weight = importance_weights(crime_weight)) %>%
+  mutate(outcome_subtype = as.factor(outcome_subtype)) %>%
+  mutate(cluster = as.factor(cluster))
+
+str(xgb_data_st)
+
+set.seed(12345)
+data_split_st <- initial_split(xgb_data_st,
+                               prop = 0.8,
+                               strata = outcome_subtype)
+train_data_st <- training(data_split_st)
+test_data_st  <- testing(data_split_st)
+
+cv_folds_st <- vfold_cv(train_data_st, v = 5, strata = outcome_subtype)
+
+xgb_specs_st <- boost_tree(trees = 1000,
+                           tree_depth = 4,
+                           learn_rate = 0.05,
+                           mtry = 15,
+                           min_n = 10,
+                           stop_iter = 30) %>%
+  set_engine("xgboost",
+             tree_method = "hist",
+             nthread = parallel::detectCores() - 1) %>% 
+  set_mode("classification")
+
+xgb_recipe_st <- recipe(outcome_subtype ~ ., data = train_data_st) %>%
+  step_dummy(cluster) %>%
+  step_downsample(outcome_subtype, under_ratio = 10.0)
+
+xgb_workflow_st <- workflow() %>%
+  add_recipe(xgb_recipe_st) %>%
+  add_model(xgb_specs_st)
+
+multiclass_metrics <- metric_set(f_meas, yardstick::mcc)
+
+```
+
+
+```{r Fitting_Model_st}
+
+# Start The Parallel Cluster
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+set.seed(12345)
+cv_results_st <- fit_resamples(xgb_workflow_st,
+                               resamples = cv_folds_st,
+                               metrics = multiclass_metrics,
+                               estimator = "macro",
+                               control = control_resamples(save_pred = TRUE))
+
+final_workflow_st <- finalize_workflow(xgb_workflow_st,
+                                       select_best(cv_results_st,
+                                                   metric = "f_meas"))
+
+final_results_st <- last_fit(final_workflow_st,
+                             split = data_split_st,
+                             metrics = multiclass_metrics,
+                             estimator = "macro")
+
+# Stop The Parallel Cluster
+stopCluster(cl)
+
+```
+
+
+```{r Model_Performance_st}
+
+model_metrics_st = collect_metrics(final_results_st, summarize = TRUE)
+print(model_metrics_st)
+collect_predictions(final_results_st) %>%
+  conf_mat(truth = outcome_subtype, estimate = .pred_class)
+
+```
+
+
+```{r Confusion_Matrix_st, fig.width=10, fig.height=6}
+
+ibm_magenta <- "#d81b60" 
+ibm_blue    <- "#5c92ff"
+
+cm_object_st <- conf_mat(collect_predictions(final_results_st), truth = outcome_subtype, estimate = .pred_class)
+cm_data_st <- as.data.frame(cm_object_st$table)
+colnames(cm_data_st) <- c("Estimate", "Truth", "Count")
+
+cm_data_st <- cm_data_st %>%
+  mutate(Estimate = fct_rev(as.factor(Estimate)),
+         Truth = as.factor(Truth), 
+         correct = (as.character(Estimate) == as.character(Truth)),
+         pct = Count / sum(Count),
+         pct_text = label_percent(accuracy = 0.1)(pct),
+         main_label = if_else(Count > 0, paste0(comma(Count),
+                                                "\n(", pct_text, ")"), "-"))
+
+ggplot(cm_data_st, aes(x = Truth, y = Estimate)) +
+  geom_tile(data = filter(cm_data_st, correct),
+            aes(fill = Count),
+            color = "white",
+            linewidth = 0.6) +
+  scale_fill_gradient(low = "#F5E6FF",
+                      high = ibm_magenta,
+                      guide = "none") +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = filter(cm_data_st, !correct),
+            aes(fill = Count),
+            color = "white",
+            linewidth = 0.6) +
+  scale_fill_gradient(low = "#E8F0FF",
+                      high = ibm_blue,
+                      guide = "none") +
+  geom_text(aes(label = main_label),
+            size = 2.5,
+            fontface = "bold",
+            lineheight = 1.1) +
+  labs(title = "Multiclass Confusion Matrix: Crime Subtypes",
+       x = "Actual Class", 
+       y = "Predicted Class") +
+  theme_minimal(base_size = 12) + 
+  theme(plot.title = element_text(face = "bold",
+                                  size = 16,
+                                  margin = margin(b = 4)),
+        plot.subtitle = element_text(color = "gray40",
+                                     size = 11,
+                                     margin = margin(b = 15)),
+        axis.title = element_text(face = "bold",
+                                  size = 13),
+        axis.text.x = element_text(color = "gray30",
+                                   size = 11,
+                                   face = "italic",
+                                   angle = 45,
+                                   hjust = 1),
+        axis.text.y = element_text(color = "gray30",
+                                   size = 11,
+                                   face = "italic"),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = NA,
+                                        color = "gray90",
+                                        linewidth = 0.5))
+
+```
+
+
+```{r Prepare_For_Data_Visualizations_st}
+
+final_xgb_st <- extract_fit_engine(final_results_st)
+trained_workflow_st <- extract_workflow(final_results_st)
+
+set.seed(123)
+sampled_test_st <- test_data_st %>%
+  group_by(outcome_subtype) %>%
+  slice_sample(prop = 1000 / nrow(test_data_st)) %>%
+  ungroup()
+
+features_sample_st <- trained_workflow_st %>%
+  extract_recipe() %>%
+  bake(new_data = sampled_test_st, all_predictors()) %>%
+  as.matrix()
+
+```
+
+
+```{r SHAP_st}
+
+
+shp_st <- shapviz(final_xgb_st, X_pred = features_sample_st, interactions = FALSE)
+labels_st <- levels(as.factor(train_data_st$outcome_subtype))
+names(shp_st) <- labels_st
+all_classes <- names(shp_st)
+
+for (current_class in all_classes) {
+  single_class_shp <- shp_st[[current_class]]
+  p_bee <- sv_importance(single_class_shp,
+                         kind = "beeswarm",
+                         show_numbers = TRUE,
+                         max_display = 10) +
+    scale_color_viridis_c(option = "plasma",
+                          breaks = c(0, 1),
+                          labels = c("Low", "High"),
+                          name = "Feature Value") +
+    labs(title = paste("SHAP Feature Importance Beeswarm:", current_class),
+         subtitle = "Isolated impact profiles on classification probability") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold",
+                                    size = 14,
+                                    margin = margin(b = 5)),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.y = element_line(color = "gray90",
+                                            linewidth = 0.5),
+          panel.grid.major.x = element_line(color = "gray95"),
+          axis.text.y = element_text(color = "black",
+                                     face = "italic"),
+          legend.title = element_text(size = 10,
+                                      face = "bold"))
+  print(p_bee)
+}
+
+
+```
+
+
+```{r Testing_Variable_Importance_Subtype}
+
+custom_f1_loss_multi <- function(observed, predicted) {
+  obs_factor <- as.factor(observed)
+  predicted_class_idx <- max.col(predicted, ties.method = "first")
+  pred_factor         <- factor(levels(obs_factor)[predicted_class_idx],
+                                levels = levels(obs_factor))
+  f1_macro <- yardstick::f_meas_vec(obs_factor, pred_factor, estimator = "macro")
+  return(1 - f1_macro)
+}
+
+multi_explainer_xgb <- explain_tidymodels(
+  model = trained_workflow_st,
+  data = train_data_st %>% select(!outcome_subtype),
+  y = train_data_st$outcome_subtype, 
+  label = "XGBoost Model: Crime Subtype Predictors",
+  verbose = FALSE
+)
+
+multi_vip_permutation <- model_parts(
+  explainer = multi_explainer_xgb,
+  loss_function = custom_f1_loss_multi,
+  B = 5
+)
+
+```
+
+
+```{r Permutation_Plots_st}
+
+class_levels <- levels(as.factor(train_data_st$outcome_subtype))
+
+for (current_level in class_levels) {
+  
+  level_loss_func <- function(observed, predicted) {
+    obs_binary <- factor(ifelse(observed == current_level, "Target", "Other"), 
+                         levels = c("Target", "Other"))
+
+    level_idx <- which(class_levels == current_level)
+    level_probs <- predicted[, level_idx]
+    
+    predicted_class_idx <- max.col(predicted, ties.method = "first")
+    pred_binary <- factor(ifelse(predicted_class_idx == level_idx, "Target", "Other"), 
+                          levels = c("Target", "Other"))
+    
+    f1_level <- yardstick::f_meas_vec(obs_binary, pred_binary, event_level = "first")
+    
+    return(1 - f1_level)
+  }
+  
+  multi_explainer_xgb$y <- as.factor(train_data_st$outcome_subtype)
+  
+  level_vip <- model_parts(
+    explainer = multi_explainer_xgb,
+    loss_function = level_loss_func,
+    B = 5
+  )
+  
+  p <- plot(level_vip)
+  
+  p_plot <- p +
+    labs(
+      title = paste("Permutation Feature Importance:", current_level),
+      subtitle = paste("Model performance degradation measured via binary F1-Score for", current_level),
+      y = NULL,
+      x = "Loss (1 - F1) After Variable Permutation"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, margin = margin(b = 5)),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(color = "gray90", linewidth = 0.5),
+      panel.grid.major.x = element_line(color = "gray95"),
+      axis.text.y = element_text(color = "black", face = "italic"),
+      legend.position = "none"
+    )
+
+  print(p_plot)
+}
+
+```
+
