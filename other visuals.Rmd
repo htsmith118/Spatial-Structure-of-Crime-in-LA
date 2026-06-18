@@ -1,13 +1,19 @@
 ---
-title: "Untitled"
-output: pdf_document
+title: "Additional visuals not already covered"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
 date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
 
 library(tidyverse)
+library(kableExtra)
 
 ##ibm colorblind palette
 ibm_blue    <- "#648FFF"
@@ -30,10 +36,280 @@ theme_ibm <- function() {
   )
 }
 
+kable_style <- function(kbl) {
+  kbl |>
+    kableExtra::kable_styling(
+      latex_options = c("striped", "hold_position"),
+      stripe_color  = "#f5f5f5",
+      font_size      = 10
+    )
+}
+
 subtype_levels <- c("Theft", "Vehicle Theft", "Vandalism",
                     "Burglary", "Shoplifting",
                     "Assault", "Robbery", "Sexual Offenses", "Other Violent")
 ```
+
+\newpage
+
+# Cross Model Comparisons
+
+## Crime Type
+
+```{r type}
+##f1 and mcc comparison across all models - replace values with actual results
+model_metrics <- tibble(
+  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
+                      each = 2),
+                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
+  metric = rep(c("F1 Score", "MCC"), times = 4),
+  value  = c(
+    0.362, 0.148,  ## naive bayes
+    0.366, 0.154,  ## elastic net
+    0.375, 0.173,  ## random forest
+    0.833, 0.233   ## xgboost
+  )
+)
+
+ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
+  geom_text(
+    aes(label = sprintf("%.3f", value)),
+    position = position_dodge(width = 0.65),
+    vjust = -0.4, size = 3
+  ) +
+  scale_fill_manual(
+    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
+    name   = "Metric"
+  ) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Crime Type Model Performance: F1 Score and MCC",
+    x     = "Model",
+    y     = "Score"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "top")
+```
+
+## Crime Subtype
+
+```{r subtype}
+##f1 and mcc comparison across all models - replace values with actual results
+model_metrics <- tibble(
+  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
+                      each = 2),
+                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
+  metric = rep(c("F1 Score", "MCC"), times = 4),
+  value  = c(
+    0.228, 0.089,  ## naive bayes
+    0.105, 0.042,  ## elastic net
+    0.156, 0.094,  ## random forest
+    0.233, 0.121   ## xgboost
+  )
+)
+
+ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
+  geom_text(
+    aes(label = round(value, 3)),
+    position = position_dodge(width = 0.65),
+    vjust = -0.4, size = 3
+  ) +
+  scale_fill_manual(
+    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
+    name   = "Metric"
+  ) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Crime Subtype Model Performance: F1 Score and MCC",
+    x     = "Model",
+    y     = "Score"
+  ) +
+  theme_ibm() +
+  theme(legend.position = "top")
+```
+
+# Naive Bayes
+
+## Equations
+
+$$P(\text{Violent} \mid \mathbf{x}) \propto P(\text{Violent}) \prod_{j \in S} P(x_j \mid \text{Violent})$$
+
+\newpage
+
+# Elastic Net
+
+## Tables
+
+```{r en-metrics-table}
+en_metrics <- tibble(
+  Metric = c(
+    "F1 Score", "MCC",
+    "Accuracy", "AUC",
+    "Sensitivity", "Specificity", 
+    "Precision", "Balanced Accuracy"
+  ),
+  Value = c(
+    "0.366", "0.154",
+    "0.560", "0.627",
+    "0.659", "0.536", 
+    "0.253", "0.598"
+  )
+)
+
+en_metrics |>
+  kbl(
+    booktabs  = TRUE,
+    align     = c("l", "r"),
+    col.names = c("Metric", "Value"),
+    caption   = "Elastic Net: Crime Type Classification Metrics"
+  ) |>
+  kable_style() |>
+  row_spec(0, bold = TRUE) |>
+  pack_rows("Primary Metrics", 1,  2) |>
+  pack_rows("Overall",         3,  8)
+```
+
+```{r en-coef-table}
+en_coefs <- tibble(
+  Predictor = c(
+    "College Degree Rate", "Single Parent Rate", "No Vehicle Rate",
+    "No HS Diploma Rate", "Disability Rate", "Cluster: Low Disadvantage",
+    "Internet Access Rate", "Poverty Rate", "Cluster: Highest Disadvantage"
+  ),
+  Coefficient = c(
+    -0.820,  0.713,  0.629,
+     0.546,  0.208, -0.101,
+    -0.092,  0.065,  0.058
+  )
+)
+
+en_coefs |>
+  arrange(desc(abs(Coefficient))) |>
+  kbl(
+    booktabs  = TRUE,
+    digits    = 4,
+    align     = c("l", "r"),
+    col.names = c("Predictor", "Coefficient"),
+    caption   = "Non-Zero Elastic Net Coefficients"
+  ) |>
+  kable_style() |>
+  row_spec(0, bold = TRUE)
+```
+
+\newpage
+
+## F1 Graph
+
+```{r en-subtype-f1-plot, fig.height=4, fig.width=6.5, fig.align="center"}
+## Replace values with exact per-class F1s from your model output
+en_f1_per_class <- c(
+  "Theft"           = 0.114,
+  "Vehicle Theft"   = 0.168,
+  "Vandalism"       = 0.043,
+  "Burglary"        = 0.192,
+  "Shoplifting"     = 0.170,
+  "Assault"         = 0.117,
+  "Robbery"         = 0.096,
+  "Sexual Offenses" = 0.021,
+  "Other Violent"   = 0.027
+)
+
+en_macro_f1 <- 0.105
+en_f1_type  <- 0.366
+
+tibble(
+  Subtype = factor(subtype_levels, levels = rev(subtype_levels)),
+  Type    = c(rep("Property", 5), rep("Violent", 4)),
+  F1      = en_f1_per_class[subtype_levels]
+) |>
+  ggplot(aes(x = Subtype, y = F1, fill = Type)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = en_macro_f1,
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_hline(yintercept = en_f1_type,
+             linetype = "dashed", color = ibm_blue, linewidth = 0.5) +
+  annotate("text", x = 0.6, y = en_macro_f1,
+           label = paste0(" Macro F1 = ", round(en_macro_f1, 3)),
+           vjust = -0.4, hjust = 0, size = 2.8, color = "gray40") +
+  annotate("text", x = 3, y = en_f1_type,
+           label = paste0("Crime Type F1 = ", round(en_f1_type, 3)),
+           vjust = -0.4, hjust = 1.1, size = 2.8, color = ibm_blue) +
+  scale_fill_manual(values = c("Property" = ibm_purple, "Violent" = ibm_magenta)) +
+  scale_y_continuous(limits = c(0, 0.5)) +
+  coord_flip() +
+  labs(title    = "Elastic Net Per-Subtype F1 Score",
+       subtitle = "Gray dashed = subtype macro F1; blue dashed = crime type F1",
+       x = NULL, y = "F1 Score", fill = NULL) +
+  theme_ibm() +
+  theme(legend.position = "bottom")
+```
+
+## Equations
+
+$$L(\boldsymbol{\beta}) = -\frac{1}{n}\sum_{i=1}^{n}\left[y_i \log(\hat{p}_i) + (1 - y_i)\log(1 - \hat{p}_i)\right] + \lambda\left[\alpha\sum_{j=1}^{p}|\beta_j| + \frac{1-\alpha}{2}\sum_{j=1}^{p}\beta_j^2\right]$$
+
+# Random Forest
+
+## Equations
+
+$$\hat{y}_i = \mathbb{1}\left(\frac{1}{B}\sum_{b=1}^{B} T_b(\mathbf{x}_i) > \tau\right)$$
+
+# XGBoost 
+
+## Confusion Matrix
+
+```{r xgb-cm-type, fig.height=4.5, fig.width=5, fig.align="center"}
+xgb_cm <- tibble(
+  Predicted  = factor(
+    c("Violent", "Violent",  "Property", "Property"),
+    levels = c("Property", "Violent")
+  ),
+  Actual     = factor(
+    c("Violent", "Property", "Violent",  "Property"),
+    levels = c("Violent", "Property")
+  ),
+  n          = c(10170, 21330, 18712, 99632),
+  pct        = c(10170, 21330, 18712, 99632) / (10170 + 21330 + 18712 + 99632),
+  cell_type  = c("tp", "fp", "fn", "tn"),
+  cell_label = c("True Positive", "False Positive", "False Negative", "True Negative")
+)
+
+xgb_cm |>
+  mutate(display = paste0(
+    format(n, big.mark = ","), "\n",
+    "(", sprintf("%.1f%%", pct * 100), ")\n",
+    cell_label
+  )) |>
+  ggplot(aes(x = Actual, y = Predicted, fill = cell_type)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = display), fontface = "bold", size = 3.2, lineheight = 1.3) +
+  scale_fill_manual(
+    values = c(
+      tp = "#F4E2F8",   ## light magenta – True Positive  (correct, low concentration)
+      tn = ibm_magenta, ## solid magenta – True Negative  (correct, high concentration)
+      fp = ibm_blue,    ## solid blue    – False Positive (incorrect, higher count)
+      fn = "#E3EBFF"    ## light blue    – False Negative (incorrect, lower count)
+    ),
+    guide = "none"
+  ) +
+  labs(
+    title    = "Confusion Matrix: Crime Type",
+    subtitle = "threshold = 0.5",
+    x        = "Actual Class",
+    y        = "Predicted Class"
+  ) +
+  theme_ibm() +
+  theme(
+    panel.grid   = element_blank(),
+    axis.ticks   = element_blank(),
+    panel.border = element_blank(),
+    axis.text    = element_text(size = 10, face = "bold")
+  )
+```
+
+## F1 Graph
 
 ```{r xgb-subtype-f1-plot, fig.height=4, fig.width=6.5, fig.align="center"}
 xgb_f1_per_class <- c(
@@ -78,74 +354,18 @@ tibble(
   theme(legend.position = "bottom")
 ```
 
-```{r type}
-##f1 and mcc comparison across all models - replace values with actual results
-model_metrics <- tibble(
-  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
-                      each = 2),
-                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
-  metric = rep(c("F1 Score", "MCC"), times = 4),
-  value  = c(
-    0.362, 0.148,  ## naive bayes
-    0.366, 0.154,  ## elastic net
-    0.375, 0.173,  ## random forest
-    0.833, 0.233   ## xgboost
-  )
-)
+# RQ2 
 
-ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
-  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
-  geom_text(
-    aes(label = sprintf("%.3f", value)),
-    position = position_dodge(width = 0.65),
-    vjust = -0.4, size = 3
-  ) +
-  scale_fill_manual(
-    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
-    name   = "Metric"
-  ) +
-  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
-  labs(
-    title = "Crime Type Model Performance: F1 Score and MCC",
-    x     = "Model",
-    y     = "Score"
-  ) +
-  theme_ibm() +
-  theme(legend.position = "top")
-```
+## Equations 
 
-```{r subtype}
-##f1 and mcc comparison across all models - replace values with actual results
-model_metrics <- tibble(
-  model  = factor(rep(c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost"),
-                      each = 2),
-                  levels = c("Naive Bayes", "Elastic Net", "Random Forest", "XGBoost")),
-  metric = rep(c("F1 Score", "MCC"), times = 4),
-  value  = c(
-    0.228, 0.089,  ## naive bayes
-    0.057, 0.028,  ## elastic net
-    0.156, 0.094,  ## random forest
-    0.233, 0.121   ## xgboost
-  )
-)
+$$y_i = \beta_0 + \sum_{k=1}^{p} \beta_k x_{ik} + \varepsilon_i$$
 
-ggplot(model_metrics, aes(x = model, y = value, fill = metric)) +
-  geom_col(position = position_dodge(width = 0.65), width = 0.6) +
-  geom_text(
-    aes(label = round(value, 3)),
-    position = position_dodge(width = 0.65),
-    vjust = -0.4, size = 3
-  ) +
-  scale_fill_manual(
-    values = c("F1 Score" = ibm_blue, "MCC" = ibm_magenta),
-    name   = "Metric"
-  ) +
-  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.08))) +
-  labs(
-    title = "Crime Subtype Model Performance: F1 Score and MCC",
-    x     = "Model",
-    y     = "Score"
-  ) +
-  theme_ibm() +
-  theme(legend.position = "top")
-```
+$$\hat{y}_i = 1.724 - 0.159(\text{Median Income}) + 0.235(\text{No Vehicle Rate}) + 
+0.088(\text{No HS Diploma Rate}) + 0.053(\text{Single Parent Rate})$$
+
+$$y_i = \beta_0(u_i, v_i) + \sum_{k=1}^{p} \beta_k(u_i, v_i)\, x_{ik} + \varepsilon_i$$
+
+$$\hat{\boldsymbol{\beta}}(u_i, v_i) = \left(\mathbf{X}'\mathbf{W}(u_i, v_i)\mathbf{X}\right)^{-1} 
+\mathbf{X}'\mathbf{W}(u_i, v_i)\mathbf{y}$$
+
+$$y_i = \beta_0(u_i, v_i) + \sum_{k=1}^{p} \beta_{h_k, k}(u_i, v_i)\, x_{ik} + \varepsilon_i$$

@@ -1,0 +1,485 @@
+---
+title: "Elastic Model"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_depth: '2'
+    df_print: paged
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(factoextra)
+library(here)
+library(sf)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+list.files(here(), recursive = TRUE)
+
+tract_data    <- readRDS(here("output", "tract_data.rds"))
+base_incident_data <- read.csv(here("output", "clustered_incident_data.csv"))
+
+
+##ibm colorblind palette
+ibm_blue    <- "#648FFF"
+ibm_purple  <- "#785EF0"
+ibm_magenta <- "#DC267F"
+ibm_orange  <- "#FE6100"
+ibm_gold    <- "#FFB000"
+
+##cluster labels and palette
+cluster_labels <- c(
+  "1" = "Low Disadvantage",
+  "2" = "Moderate Disadvantage",
+  "3" = "High Disadvantage",
+  "4" = "Highest Disadvantage"
+)
+
+ibm_palette <- c(
+  "Low Disadvantage"      = ibm_purple,
+  "Moderate Disadvantage" = ibm_blue,
+  "High Disadvantage"     = ibm_orange,
+  "Highest Disadvantage"  = ibm_magenta
+)
+
+##styling
+theme_ibm <- function() {
+  theme_light() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.background = element_rect(fill = "#E8EEFF", color = NA),
+    strip.text       = element_text(face = "bold", size = 10, color = "#1a1a1a"),
+    axis.text        = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+}
+```
+
+```{r elastic-net, cache=TRUE}
+# Elastic Net Models (RQ1)
+knitr::opts_chunk$set(cache = FALSE)
+
+library(dplyr)
+library(glmnet)
+library(caret)
+library(pROC)
+library(MLmetrics)
+library(mltools)
+library(knitr)
+library(ggplot2)
+library(doParallel)
+
+# Load Data
+clustered_incident_data = read.csv(here("output", "clustered_incident_data.csv"))
+
+# Predictors
+predictors = c(
+  "median_income",
+  "gini",
+  "poverty_rate",
+  "unemployment_rate",
+  "no_vehicle_rate",
+  "housing_burden_rate",
+  "vacancy_rate",
+  "renter_rate",
+  "single_parent_rate",
+  "lang_isolation_rate",
+  "internet_rate",
+  "edu_rate_no_hsdip",
+  "edu_rate_college",
+  "disability_rate",
+  "cluster"
+)
+
+
+# Part 1: Binary (Violent vs Property)
+
+
+enet_data <- clustered_incident_data |>
+  select(is_violent, all_of(predictors)) |>
+  na.omit()
+
+enet_data$is_violent <- factor(
+  ifelse(enet_data$is_violent, 1, 0),
+  levels = c(0, 1)
+)
+
+x <- model.matrix(is_violent ~ ., data = enet_data)[, -1]
+y <- enet_data$is_violent
+
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.80, list = FALSE)
+
+x_train <- x[train_idx, ]
+x_test  <- x[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+cv_enet <- cv.glmnet(
+  x_train, y_train,
+  family       = "binomial",
+  alpha        = 0.5,
+  nfolds       = 5,
+  type.measure = "auc"
+)
+plot(
+  cv_enet,
+  main = expression(
+    "Cross-Validated Elastic Net (" * alpha * " = 0.5)"
+  )
+)
+best_lambda <- cv_enet$lambda.1se
+cat("Optimal Lambda:", best_lambda, "\n")
+
+elastic_net <- glmnet(
+  x_train, y_train,
+  family = "binomial",
+  alpha  = 0.5,
+  lambda = best_lambda
+)
+
+pred_prob <- as.vector(
+  predict(
+    elastic_net,
+    newx = x_test,
+    s    = best_lambda,
+    type = "response"
+  )
+)
+
+roc_obj   <- roc(as.numeric(y_test) - 1, pred_prob)
+auc_value <- auc(roc_obj)
+cat("AUC:", round(auc_value, 4), "\n")
+
+best_threshold <- as.numeric(
+  coords(roc_obj, "best", ret = "threshold")
+)
+cat("Optimal Threshold:", round(best_threshold, 4), "\n")
+
+pred_class <- factor(
+  ifelse(pred_prob >= best_threshold, "1", "0"),
+  levels = c("0", "1")
+)
+y_test <- factor(y_test, levels = c("0", "1"))
+
+cm <- confusionMatrix(pred_class, y_test, positive = "1")
+f1 <- F1_Score(
+  y_pred   = pred_class,
+  y_true   = y_test,
+  positive = "1"
+)
+
+mcc_value <- mcc(
+  preds   = as.integer(pred_class) - 1,
+  actuals = as.integer(y_test) - 1
+)
+
+tibble(
+  Metric = c(
+    "Accuracy",
+    "AUC",
+    "F1 Score",
+    "Matthews Correlation Coefficient",
+    "Sensitivity / Recall",
+    "Specificity",
+    "Precision",
+    "Balanced Accuracy"
+  ),
+  Value = round(c(
+    cm$overall["Accuracy"],
+    as.numeric(auc_value),
+    f1,
+    mcc_value,
+    cm$byClass["Sensitivity"],
+    cm$byClass["Specificity"],
+    cm$byClass["Pos Pred Value"],
+    cm$byClass["Balanced Accuracy"]
+  ), 4)
+) |>
+  kable(
+    caption = "Elastic Net Binary Classification Performance",
+    align   = c("l", "r")
+  )
+
+# Store binary F1 for comparison plot later
+binary_f1 <- f1
+
+
+# ROC Curve
+plot(
+  roc_obj,
+  main = paste("ROC Curve — AUC:", round(auc_value, 3)),
+  col  = "#224499",
+  lwd  = 2,
+  xlab = "False Positive Rate",
+  ylab = "True Positive Rate"
+)
+abline(a = 1, b = 0, lty = 2, col = "gray60")
+
+
+# Coefficients
+coef_table <- data.frame(
+  Predictor   = rownames(coef(elastic_net)),
+  Coefficient = as.numeric(coef(elastic_net))
+) |>
+  filter(Predictor != "(Intercept)", abs(Coefficient) > 0.01) |>
+  arrange(desc(abs(Coefficient)))
+
+kable(
+  coef_table,
+  digits  = 4,
+  caption = "Non-zero Elastic Net Coefficients"
+)
+
+
+# Confusion Matrix Plot
+library(ggnewscale)
+cm_plot <- data.frame(
+  Actual    = c("Violent", "Property", "Violent", "Property"),
+  Predicted = c("Violent", "Violent",  "Property", "Property"),
+  Count     = c(19028, 56093, 9854, 64868),
+  Type      = c("True Positive", "False Positive",
+                "False Negative", "True Negative")
+)
+cm_plot$Percent <- round(100 * cm_plot$Count / sum(cm_plot$Count), 1)
+cm_plot$Label   <- paste0(
+  format(cm_plot$Count, big.mark = ","),
+  "\n(", cm_plot$Percent, "%)\n",
+  cm_plot$Type
+)
+cm_plot$correct <- cm_plot$Type %in% c("True Positive", "True Negative")
+cm_plot$Actual    <- factor(cm_plot$Actual,    levels = c("Violent", "Property"))
+cm_plot$Predicted <- factor(cm_plot$Predicted, levels = c("Property", "Violent"))
+
+ggplot(cm_plot, aes(x = Actual, y = Predicted)) +
+  geom_tile(data = filter(cm_plot, correct),
+            aes(fill = Count), color = "white", linewidth = 1.2) +
+  scale_fill_gradient(low = "#F5E6FF", high = "#DC267F", guide = "none") +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = filter(cm_plot, !correct),
+            aes(fill = Count), color = "white", linewidth = 1.2) +
+  scale_fill_gradient(low = "#E8F0FF", high = "#648FFF", guide = "none") +
+  geom_text(aes(label = Label), fontface = "bold", size = 4.5) +
+  labs(
+    title    = "Confusion Matrix: Elastic Net",
+    subtitle = paste0("threshold = ", round(best_threshold, 3)),
+    x        = "Actual Class",
+    y        = "Predicted Class"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    panel.grid  = element_blank(),
+    plot.title  = element_text(face = "bold", size = 20),
+    axis.title  = element_text(face = "bold")
+  )
+
+
+
+
+# Part 2: Multinomial (outcome Subtype)
+
+valid_categories <- c(
+  "Theft", "Vehicle Theft", "Vandalism",
+  "Burglary", "Shoplifting",
+  "Assault", "Robbery", "Sexual Offenses", "Other Violent"
+)
+
+multi_data <- clustered_incident_data |>
+  select(outcome_subtype, all_of(predictors)) |>
+  filter(outcome_subtype %in% valid_categories) |>
+  na.omit() |>
+  mutate(outcome_subtype = factor(outcome_subtype, levels = valid_categories))
+
+multi_x <- model.matrix(outcome_subtype ~ ., data = multi_data)[, -1]
+multi_y <- multi_data$outcome_subtype
+
+set.seed(123)
+multi_train_idx <- createDataPartition(multi_y, p = 0.80, list = FALSE)
+
+multi_x_train <- multi_x[multi_train_idx, ]
+multi_x_test  <- multi_x[-multi_train_idx, ]
+multi_y_train <- multi_y[multi_train_idx]
+multi_y_test  <- multi_y[-multi_train_idx]
+
+
+
+# Inverse-frequency weights
+class_counts  <- table(multi_y_train)
+class_weights <- 1 / class_counts[as.character(multi_y_train)]
+class_weights <- as.numeric(
+  class_weights / sum(class_weights) * length(multi_y_train)
+)
+
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+multi_cv <- cv.glmnet(
+  multi_x_train, multi_y_train,
+  family       = "multinomial",
+  alpha        = 0.5,
+  nfolds       = 5,
+  nlambda      = 50,
+  type.measure = "deviance",
+  weights      = class_weights,
+  parallel     = TRUE
+)
+multi_lambda <- multi_cv$lambda.1se
+
+stopImplicitCluster()
+
+multi_enet <- glmnet(
+  multi_x_train, multi_y_train,
+  family  = "multinomial",
+  alpha   = 0.5,
+  lambda  = multi_lambda,
+  weights = class_weights
+)
+
+multi_pred <- predict(
+  multi_enet,
+  newx = multi_x_test,
+  s    = multi_lambda,
+  type = "class"
+) |> as.vector() |> factor(levels = levels(multi_y_test))
+
+multi_cm <- confusionMatrix(multi_pred, multi_y_test)
+print(multi_cm)
+
+f1_per_class <- multi_cm$byClass[, "F1"]
+cat("\nPer-Class F1:\n")
+print(round(f1_per_class, 4))
+cat("\nMacro F1:", round(mean(f1_per_class, na.rm = TRUE), 4), "\n")
+
+
+
+# Coefficients
+coef_list <- coef(multi_enet)
+
+multi_coef_table <- lapply(names(coef_list), function(cls) {
+  mat <- as.matrix(coef_list[[cls]])
+  data.frame(
+    Class       = cls,
+    Predictor   = rownames(mat),
+    Coefficient = as.numeric(mat)
+  )
+}) |>
+  bind_rows() |>
+  filter(Predictor != "(Intercept)", abs(Coefficient) > 0.01) |>
+  arrange(Class, desc(abs(Coefficient)))
+
+kable(
+  multi_coef_table,
+  digits  = 4,
+  caption = "Non-zero Multinomial Elastic Net Coefficients by Class"
+)
+
+
+# Per-Subtype F1 Plot
+f1_df <- data.frame(
+  Subtype = gsub("Class: ", "", names(f1_per_class)),
+  F1      = as.numeric(f1_per_class)
+) |>
+  filter(!is.na(F1)) |>
+  mutate(
+    CrimeType = case_when(
+  Subtype %in% c("Assault", "Robbery", "Sexual Offenses",
+                 "Other Violent") ~ "Violent",
+  TRUE ~ "Property"
+  ),
+    Subtype = reorder(Subtype, F1)
+  )
+
+macro_f1 <- mean(f1_df$F1, na.rm = TRUE)
+
+ggplot(f1_df, aes(x = F1, y = Subtype, fill = CrimeType)) +
+  geom_col() +
+  geom_vline(
+    xintercept = macro_f1,
+    linetype   = "dashed",
+    color      = "gray40",
+    linewidth  = 0.7
+  ) +
+  geom_vline(
+    xintercept = binary_f1,
+    linetype   = "dashed",
+    color      = "#4488FF",
+    linewidth  = 0.7
+  ) +
+  annotate(
+    "text",
+    x     = macro_f1 + 0.005,
+    y     = 1.5,
+    label = paste0("Macro F1 = ", round(macro_f1, 3)),
+    hjust = 0, size = 3.5, color = "gray40"
+  ) +
+  annotate(
+    "text",
+    x     = binary_f1 + 0.005,
+    y     = 3,
+    label = paste0("Crime Type F1 = ", round(binary_f1, 3)),
+    hjust = 1, size = 3.5, color = "#4488FF"
+  ) +
+  scale_fill_manual(
+  values = c("Property" = "#785EF0", "Violent" = "#DC267F")
+  ) +
+  labs(
+    title    = "Per-Subtype F1 Score",
+    subtitle = "Gray dashed = subtype macro F1; blue dashed = crime type F1",
+    x        = "F1 Score",
+    y        = NULL,
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    legend.position    = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+```{r subtype_metrics}
+##overall multiclass MCC — coerce table to plain numeric matrix first
+n_cls     <- length(levels(multi_y_test))
+conf_num  <- matrix(as.numeric(multi_cm$table), nrow = n_cls, ncol = n_cls)
+multi_mcc <- mcc(confusionM = conf_num)
+cat("Multinomial Elastic Net MCC:", round(multi_mcc, 4), "\n")
+
+##per-class MCC using one-vs-rest binarization
+classes <- levels(multi_y_test)
+
+per_class_mcc <- sapply(classes, function(cls) {
+  binary_pred   <- as.integer(multi_pred == cls)
+  binary_actual <- as.integer(multi_y_test == cls)
+  mcc(preds = binary_pred, actuals = binary_actual)
+})
+
+##strip "Class: " prefix from confusionMatrix byClass rownames to match class labels
+subtype_names <- gsub("Class: ", "", names(f1_per_class))
+
+##combine F1 and per-class MCC into a single summary table
+subtype_metrics <- data.frame(
+  Subtype = subtype_names,
+  F1      = round(as.numeric(f1_per_class), 4),
+  MCC     = round(per_class_mcc[subtype_names], 4)
+) |>
+  arrange(desc(F1))
+
+kable(
+  subtype_metrics,
+  caption   = "Per-Class F1 and MCC — Multinomial Elastic Net",
+  align     = c("l", "r", "r"),
+  col.names = c("Subtype", "F1 Score", "MCC")
+)
+```
